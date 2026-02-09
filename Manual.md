@@ -40,6 +40,21 @@ Optional release build:
 cargo build --release --manifest-path gui/Cargo.toml
 ```
 
+### 2.1 Supported Platforms
+
+The project is currently confirmed to build and run on:
+
+- Ubuntu (validated in this project on Ubuntu 24)
+- macOS (validated on M4 Max with no code changes required)
+
+Validation used:
+
+```bash
+go build -o vcs .
+cargo build --manifest-path gui/Cargo.toml
+cargo test --manifest-path gui/Cargo.toml
+```
+
 ## 3. Starting the GUI
 
 Launch:
