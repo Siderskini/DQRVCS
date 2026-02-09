@@ -141,6 +141,11 @@ From repo root:
 cargo run --manifest-path gui/Cargo.toml
 ```
 
+### Documentation
+
+- `GettingStarted.md`: short decentralized GUI onboarding for Git users
+- `Manual.md`: full GUI reference and troubleshooting
+
 If `cargo build --release` fails with a `rust-lld`/`.eh_frame` linker error, this repo already pins Rust linker flags in:
 
 - `.cargo/config.toml`

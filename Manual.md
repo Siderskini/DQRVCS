@@ -6,6 +6,35 @@ SPDX-License-Identifier: Apache-2.0
 
 # VCS GUI User Manual
 
+## Table of Contents
+
+[1. Purpose](#1-purpose)  
+[2. Prerequisites](#2-prerequisites)  
+	[2.1 Supported Platforms](#21-supported-platforms)  
+[3. Starting the GUI](#3-starting-the-gui)  
+[4. Top Control Bar](#4-top-control-bar)  
+[5. Screen Layout](#5-screen-layout)  
+[6. Core Workflows](#6-core-workflows)  
+	[6.1 Add/Remove Peers](#61-addremove-peers)  
+	[6.2 Stage, Commit, and Push](#62-stage-commit-and-push)  
+	[6.3 Review Diffs and Graph](#63-review-diffs-and-graph)  
+	[6.4 Resolve Merge Conflicts](#64-resolve-merge-conflicts)  
+	[6.5 Use Advanced History Tools](#65-use-advanced-history-tools)  
+	[6.6 Run Restricted VCS CLI Commands](#66-run-restricted-vcs-cli-commands)  
+	[6.7 Sync Gossip Data](#67-sync-gossip-data)  
+	[6.8 Process Pending Pushes](#68-process-pending-pushes)  
+	[6.9 Propose, Vote, Certify](#69-propose-vote-certify)  
+	[6.10 Update Consensus Membership/Threshold](#610-update-consensus-membershipthreshold)  
+[7. Data Files Used by GUI](#7-data-files-used-by-gui)  
+[8. Troubleshooting](#8-troubleshooting)  
+	[8.1 Both repository path and vcs binary must be set](#81-both-repository-path-and-vcs-binary-must-be-set)  
+	[8.2 Command failed for peer actions](#82-command-failed-for-peer-actions)  
+	[8.3 No proposals/pending/ops visible](#83-no-proposalspendingops-visible)  
+	[8.4 Git HEAD errors on new repos](#84-git-head-errors-on-new-repos)  
+	[8.5 Release linker errors](#85-release-linker-errors-cc-rust-lld-eh_frame)  
+[9. Current GUI Scope and Limits](#9-current-gui-scope-and-limits)  
+[10. Quick Command Equivalents](#10-quick-command-equivalents)
+
 ## 1. Purpose
 This manual explains how to use the Rust GUI for the VCS project (`gui/`), including:
 
@@ -325,12 +354,12 @@ It also runs Git commands in the selected repository path for branch/HEAD/status
 
 ## 8. Troubleshooting
 
-## 8.1 "Both repository path and vcs binary must be set."
+## 8.1 Both repository path and vcs binary must be set
 
 - Fill both top-bar fields.
 - Verify `vcs binary` points to a real executable.
 
-## 8.2 "command failed: ... peer ..."
+## 8.2 Command failed for peer actions
 
 - Ensure URL format is valid (include host/port).
 - Example: `http://127.0.0.1:8788`
@@ -350,7 +379,7 @@ If repository has no commits, GUI intentionally shows:
 
 Create an initial commit to populate `HEAD`.
 
-## 8.5 Release linker errors (`cc` / `rust-lld` / `.eh_frame`)
+## 8.5 Release linker errors (`cc`, `rust-lld`, `.eh_frame`)
 
 This repo already includes Cargo linker configuration:
 
