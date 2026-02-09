@@ -3,12 +3,14 @@ use eframe::egui::{self, Color32, ComboBox, RichText, TextEdit, Ui};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn main() -> eframe::Result<()> {
@@ -25,6 +27,51 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(VcsGuiApp::new()))
         }),
     )
+}
+
+#[derive(Debug, Clone, Default)]
+struct CommandExecution {
+    success: bool,
+    status_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+trait CommandRunner {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &str,
+        envs: &[(String, String)],
+    ) -> Result<CommandExecution, String>;
+}
+
+struct ProcessCommandRunner;
+
+impl CommandRunner for ProcessCommandRunner {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &str,
+        envs: &[(String, String)],
+    ) -> Result<CommandExecution, String> {
+        let mut cmd = Command::new(program);
+        cmd.current_dir(cwd);
+        cmd.args(args);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+
+        let output = cmd.output().map_err(|err| err.to_string())?;
+        Ok(CommandExecution {
+            success: output.status.success(),
+            status_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        })
+    }
 }
 
 struct VcsGuiApp {
@@ -46,6 +93,8 @@ struct VcsGuiApp {
     merge_form: MergeForm,
     history_form: HistoryForm,
     consensus_form: ConsensusForm,
+    command_runner: Arc<dyn CommandRunner + Send + Sync>,
+    refresh_after_command: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -340,6 +389,13 @@ struct ProposalView {
 
 impl VcsGuiApp {
     fn new() -> Self {
+        Self::new_with_runner(Arc::new(ProcessCommandRunner), true)
+    }
+
+    fn new_with_runner(
+        command_runner: Arc<dyn CommandRunner + Send + Sync>,
+        initial_refresh: bool,
+    ) -> Self {
         let repo_guess = guess_repo_root()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let repo_text = repo_guess.to_string_lossy().to_string();
@@ -375,8 +431,21 @@ impl VcsGuiApp {
             merge_form: MergeForm::default(),
             history_form: HistoryForm::default(),
             consensus_form: ConsensusForm::default(),
+            command_runner,
+            refresh_after_command: true,
         };
-        app.refresh();
+        if initial_refresh {
+            app.refresh();
+        }
+        app
+    }
+
+    #[cfg(test)]
+    fn new_for_tests(command_runner: Arc<dyn CommandRunner + Send + Sync>) -> Self {
+        let mut app = Self::new_with_runner(command_runner, false);
+        app.repo_path = ".".to_string();
+        app.vcs_binary = "vcs".to_string();
+        app.refresh_after_command = false;
         app
     }
 
@@ -506,33 +575,30 @@ impl VcsGuiApp {
             return;
         }
 
-        let mut cmd = Command::new(program);
-        cmd.current_dir(cwd);
-        cmd.args(args);
-        for (key, value) in envs {
-            cmd.env(key, value);
-        }
-        match cmd.output() {
+        match self.command_runner.run(program, args, cwd, envs) {
             Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                self.action_output = if output.status.success() {
+                let stdout = output.stdout.trim().to_string();
+                let stderr = output.stderr.trim().to_string();
+                self.action_output = if output.success {
                     if stdout.is_empty() {
                         format!("{context} completed")
                     } else {
                         stdout
                     }
                 } else if stderr.is_empty() {
-                    format!("{context} failed: {}", output.status)
+                    match output.status_code {
+                        Some(code) => format!("{context} failed: exit code {code}"),
+                        None => format!("{context} failed"),
+                    }
                 } else {
                     format!("{context} failed: {stderr}")
                 };
             }
-            Err(err) => {
-                self.action_output = format!("failed to execute {context}: {err}");
-            }
+            Err(err) => self.action_output = format!("failed to execute {context}: {err}"),
         }
-        self.refresh();
+        if self.refresh_after_command {
+            self.refresh();
+        }
     }
 
     fn run_command(&mut self, program: &str, args: &[String], context: &str) {
@@ -768,6 +834,263 @@ impl VcsGuiApp {
         self.run_vcs_command(&tokens);
     }
 
+    fn on_stage_all(&mut self) {
+        self.run_vcs_command_static(&["stage"]);
+    }
+
+    fn on_unstage_all(&mut self) {
+        self.run_vcs_command_static(&["unstage"]);
+    }
+
+    fn on_stage_file(&mut self) {
+        match build_path_action_args(
+            "stage",
+            self.git_form.selected_diff_file.trim(),
+            "Select a file to stage",
+        ) {
+            Ok(args) => self.run_vcs_command(&args),
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn on_unstage_file(&mut self) {
+        match build_path_action_args(
+            "unstage",
+            self.git_form.selected_diff_file.trim(),
+            "Select a file to unstage",
+        ) {
+            Ok(args) => self.run_vcs_command(&args),
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn on_commit(&mut self, all: bool) {
+        match build_commit_args(self.git_form.commit_message.trim(), all) {
+            Ok(args) => self.run_vcs_command(&args),
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn on_amend(&mut self) {
+        let args = build_amend_args(self.git_form.commit_message.trim());
+        self.run_vcs_command(&args);
+    }
+
+    fn on_checkout(&mut self) {
+        match build_checkout_args(self.git_form.checkout_target.trim()) {
+            Ok(args) => self.run_vcs_command(&args),
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn on_revert(&mut self, no_commit: bool) {
+        match build_revert_args(self.git_form.revert_target.trim(), no_commit) {
+            Ok(args) => self.run_vcs_command(&args),
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn on_pull(&mut self) {
+        self.run_vcs_command_static(&["pull"]);
+    }
+
+    fn on_push(&mut self, immediate: bool) {
+        if immediate {
+            self.run_vcs_command_static(&["push", "--no-auto-proposal"]);
+        } else {
+            self.run_vcs_command_static(&["push"]);
+        }
+    }
+
+    fn on_squash(&mut self) {
+        match build_squash_args(
+            self.git_form.squash_last.trim(),
+            self.git_form.squash_from.trim(),
+            self.git_form.squash_message.trim(),
+            self.git_form.squash_allow_dirty,
+        ) {
+            Ok(args) => self.run_vcs_command(&args),
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn on_start_merge(&mut self) {
+        match build_merge_start_args(self.merge_form.merge_target.trim()) {
+            Ok(args) => self.run_git_command(&args),
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn on_resolve_conflict_with_side(&mut self, strategy: &str) {
+        match build_conflict_resolution_args(
+            strategy,
+            self.merge_form.selected_conflict_file.trim(),
+        ) {
+            Ok(args) => self.run_git_command(&args),
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn on_mark_conflict_resolved_add(&mut self) {
+        match build_git_add_path_args(self.merge_form.selected_conflict_file.trim()) {
+            Ok(args) => self.run_git_command(&args),
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn on_commit_merge(&mut self) {
+        match build_merge_commit_args(self.merge_form.merge_commit_message.trim()) {
+            Ok(args) => self.run_git_command(&args),
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn on_run_rebase(&mut self) {
+        match build_rebase_args(
+            self.history_form.rebase_onto.trim(),
+            self.history_form.rebase_autosquash,
+            self.history_form.rebase_autostash,
+            self.history_form.rebase_merges,
+        ) {
+            Ok(args) => self.run_git_command(&args),
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn on_run_cherry_pick(&mut self) {
+        match build_cherry_pick_args(
+            self.history_form.cherry_pick_refs.trim(),
+            self.history_form.cherry_pick_no_commit,
+        ) {
+            Ok(args) => self.run_git_command(&args),
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn on_run_reset(&mut self) {
+        match build_reset_args(
+            self.history_form.reset_target.trim(),
+            self.history_form.reset_mode,
+            self.history_form.confirm_hard_reset,
+        ) {
+            Ok(args) => self.run_git_command(&args),
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn on_apply_consensus_config(&mut self, clear_members: bool) {
+        let members = if clear_members {
+            ""
+        } else {
+            self.consensus_form.members_csv.trim()
+        };
+        match build_consensus_config_args(
+            self.consensus_form.threshold.trim(),
+            members,
+            clear_members,
+        ) {
+            Ok(args) => {
+                self.run_vcs_command(&args);
+                if clear_members {
+                    self.consensus_form.members_csv.clear();
+                }
+            }
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn on_add_peer(&mut self) {
+        let peer = self.peer_form.peer_url.trim().to_string();
+        if peer.is_empty() {
+            self.action_output = "peer URL cannot be empty".to_string();
+            return;
+        }
+        self.run_vcs_command(&vec!["peer".to_string(), "add".to_string(), peer.clone()]);
+        let failed = self.action_output.starts_with("vcs command failed:")
+            || self
+                .action_output
+                .starts_with("failed to execute vcs command:");
+        if !failed {
+            self.peer_form.peer_url.clear();
+        }
+    }
+
+    fn on_remove_peer(&mut self, peer: String) {
+        self.run_vcs_command(&vec!["peer".to_string(), "remove".to_string(), peer]);
+    }
+
+    fn on_sync_now(&mut self) {
+        self.run_vcs_command(&vec!["sync".to_string()]);
+    }
+
+    fn on_process_pending_pushes(&mut self) {
+        self.run_vcs_command(&vec!["push".to_string(), "--process-pending".to_string()]);
+    }
+
+    fn on_list_pending_queue(&mut self) {
+        self.run_vcs_command(&vec!["push".to_string(), "--list-pending".to_string()]);
+    }
+
+    fn on_propose(&mut self) {
+        let mut args = vec![
+            "consensus".to_string(),
+            "propose".to_string(),
+            "--ref".to_string(),
+            self.propose_form.reference.trim().to_string(),
+            "--new".to_string(),
+            self.propose_form.new_oid.trim().to_string(),
+        ];
+        let old_oid = self.propose_form.old_oid.trim();
+        if !old_oid.is_empty() {
+            args.push("--old".to_string());
+            args.push(old_oid.to_string());
+        }
+        let epoch = self.propose_form.epoch.trim();
+        if !epoch.is_empty() {
+            args.push("--epoch".to_string());
+            args.push(epoch.to_string());
+        }
+        let ttl = self.propose_form.ttl_hours.trim();
+        if !ttl.is_empty() {
+            args.push("--ttl".to_string());
+            args.push(format!("{ttl}h"));
+        }
+        self.run_vcs_command(&args);
+    }
+
+    fn on_cast_vote(&mut self) {
+        let mut args = vec![
+            "consensus".to_string(),
+            "vote".to_string(),
+            "--proposal".to_string(),
+            self.vote_form.proposal_id.trim().to_string(),
+        ];
+        args.push(if self.vote_form.vote_yes {
+            "--yes".to_string()
+        } else {
+            "--no".to_string()
+        });
+        self.run_vcs_command(&args);
+    }
+
+    fn on_certify(&mut self) {
+        self.run_vcs_command(&vec![
+            "consensus".to_string(),
+            "certify".to_string(),
+            "--proposal".to_string(),
+            self.vote_form.proposal_id.trim().to_string(),
+        ]);
+    }
+
+    fn on_consensus_status(&mut self) {
+        self.run_vcs_command(&vec![
+            "consensus".to_string(),
+            "status".to_string(),
+            "--proposal".to_string(),
+            self.vote_form.proposal_id.trim().to_string(),
+        ]);
+    }
+
     fn draw_top_controls(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.label("Repository");
@@ -831,10 +1154,10 @@ impl VcsGuiApp {
 
             ui.horizontal(|ui| {
                 if ui.button("Stage all").clicked() {
-                    self.run_vcs_command_static(&["stage"]);
+                    self.on_stage_all();
                 }
                 if ui.button("Unstage all").clicked() {
-                    self.run_vcs_command_static(&["unstage"]);
+                    self.on_unstage_all();
                 }
             });
 
@@ -861,24 +1184,10 @@ impl VcsGuiApp {
 
                 ui.horizontal(|ui| {
                     if ui.button("Stage file").clicked() {
-                        match build_path_action_args(
-                            "stage",
-                            self.git_form.selected_diff_file.trim(),
-                            "Select a file to stage",
-                        ) {
-                            Ok(args) => self.run_vcs_command(&args),
-                            Err(err) => self.action_output = err,
-                        }
+                        self.on_stage_file();
                     }
                     if ui.button("Unstage file").clicked() {
-                        match build_path_action_args(
-                            "unstage",
-                            self.git_form.selected_diff_file.trim(),
-                            "Select a file to unstage",
-                        ) {
-                            Ok(args) => self.run_vcs_command(&args),
-                            Err(err) => self.action_output = err,
-                        }
+                        self.on_unstage_file();
                     }
                 });
             }
@@ -892,20 +1201,13 @@ impl VcsGuiApp {
             });
             ui.horizontal(|ui| {
                 if ui.button("Commit").clicked() {
-                    match build_commit_args(self.git_form.commit_message.trim(), false) {
-                        Ok(args) => self.run_vcs_command(&args),
-                        Err(err) => self.action_output = err,
-                    }
+                    self.on_commit(false);
                 }
                 if ui.button("Commit all").clicked() {
-                    match build_commit_args(self.git_form.commit_message.trim(), true) {
-                        Ok(args) => self.run_vcs_command(&args),
-                        Err(err) => self.action_output = err,
-                    }
+                    self.on_commit(true);
                 }
                 if ui.button("Amend").clicked() {
-                    let args = build_amend_args(self.git_form.commit_message.trim());
-                    self.run_vcs_command(&args);
+                    self.on_amend();
                 }
             });
 
@@ -916,10 +1218,7 @@ impl VcsGuiApp {
                     TextEdit::singleline(&mut self.git_form.checkout_target).desired_width(240.0),
                 );
                 if ui.button("Checkout").clicked() {
-                    match build_checkout_args(self.git_form.checkout_target.trim()) {
-                        Ok(args) => self.run_vcs_command(&args),
-                        Err(err) => self.action_output = err,
-                    }
+                    self.on_checkout();
                 }
             });
 
@@ -927,29 +1226,23 @@ impl VcsGuiApp {
                 ui.label("Revert commit");
                 ui.add(TextEdit::singleline(&mut self.git_form.revert_target).desired_width(240.0));
                 if ui.button("Revert").clicked() {
-                    match build_revert_args(self.git_form.revert_target.trim(), false) {
-                        Ok(args) => self.run_vcs_command(&args),
-                        Err(err) => self.action_output = err,
-                    }
+                    self.on_revert(false);
                 }
                 if ui.button("Revert (--no-commit)").clicked() {
-                    match build_revert_args(self.git_form.revert_target.trim(), true) {
-                        Ok(args) => self.run_vcs_command(&args),
-                        Err(err) => self.action_output = err,
-                    }
+                    self.on_revert(true);
                 }
             });
 
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Pull").clicked() {
-                    self.run_vcs_command_static(&["pull"]);
+                    self.on_pull();
                 }
                 if ui.button("Push").clicked() {
-                    self.run_vcs_command_static(&["push"]);
+                    self.on_push(false);
                 }
                 if ui.button("Push immediate").clicked() {
-                    self.run_vcs_command_static(&["push", "--no-auto-proposal"]);
+                    self.on_push(true);
                 }
             });
 
@@ -968,15 +1261,7 @@ impl VcsGuiApp {
                     TextEdit::singleline(&mut self.git_form.squash_message).desired_width(280.0),
                 );
                 if ui.button("Squash").clicked() {
-                    match build_squash_args(
-                        self.git_form.squash_last.trim(),
-                        self.git_form.squash_from.trim(),
-                        self.git_form.squash_message.trim(),
-                        self.git_form.squash_allow_dirty,
-                    ) {
-                        Ok(args) => self.run_vcs_command(&args),
-                        Err(err) => self.action_output = err,
-                    }
+                    self.on_squash();
                 }
             });
         });
@@ -991,10 +1276,7 @@ impl VcsGuiApp {
                     TextEdit::singleline(&mut self.merge_form.merge_target).desired_width(220.0),
                 );
                 if ui.button("Start merge").clicked() {
-                    match build_merge_start_args(self.merge_form.merge_target.trim()) {
-                        Ok(args) => self.run_git_command(&args),
-                        Err(err) => self.action_output = err,
-                    }
+                    self.on_start_merge();
                 }
             });
 
@@ -1107,29 +1389,13 @@ impl VcsGuiApp {
 
                 ui.horizontal(|ui| {
                     if ui.button("Use ours").clicked() {
-                        match build_conflict_resolution_args(
-                            "--ours",
-                            self.merge_form.selected_conflict_file.trim(),
-                        ) {
-                            Ok(args) => self.run_git_command(&args),
-                            Err(err) => self.action_output = err,
-                        }
+                        self.on_resolve_conflict_with_side("--ours");
                     }
                     if ui.button("Use theirs").clicked() {
-                        match build_conflict_resolution_args(
-                            "--theirs",
-                            self.merge_form.selected_conflict_file.trim(),
-                        ) {
-                            Ok(args) => self.run_git_command(&args),
-                            Err(err) => self.action_output = err,
-                        }
+                        self.on_resolve_conflict_with_side("--theirs");
                     }
                     if ui.button("Mark resolved (add)").clicked() {
-                        match build_git_add_path_args(self.merge_form.selected_conflict_file.trim())
-                        {
-                            Ok(args) => self.run_git_command(&args),
-                            Err(err) => self.action_output = err,
-                        }
+                        self.on_mark_conflict_resolved_add();
                     }
                     if ui.button("Load in Diff panel").clicked() {
                         let selected = self.merge_form.selected_conflict_file.trim();
@@ -1241,10 +1507,7 @@ impl VcsGuiApp {
                         .desired_width(300.0),
                 );
                 if ui.button("Commit merge").clicked() {
-                    match build_merge_commit_args(self.merge_form.merge_commit_message.trim()) {
-                        Ok(args) => self.run_git_command(&args),
-                        Err(err) => self.action_output = err,
-                    }
+                    self.on_commit_merge();
                 }
             });
         });
@@ -1316,15 +1579,7 @@ impl VcsGuiApp {
             });
             ui.horizontal(|ui| {
                 if ui.button("Run rebase").clicked() {
-                    match build_rebase_args(
-                        self.history_form.rebase_onto.trim(),
-                        self.history_form.rebase_autosquash,
-                        self.history_form.rebase_autostash,
-                        self.history_form.rebase_merges,
-                    ) {
-                        Ok(args) => self.run_git_command(&args),
-                        Err(err) => self.action_output = err,
-                    }
+                    self.on_run_rebase();
                 }
                 if ui.button("Continue rebase").clicked() {
                     self.run_git_command_static(&["rebase", "--continue"]);
@@ -1372,13 +1627,7 @@ impl VcsGuiApp {
             });
             ui.horizontal(|ui| {
                 if ui.button("Run cherry-pick").clicked() {
-                    match build_cherry_pick_args(
-                        self.history_form.cherry_pick_refs.trim(),
-                        self.history_form.cherry_pick_no_commit,
-                    ) {
-                        Ok(args) => self.run_git_command(&args),
-                        Err(err) => self.action_output = err,
-                    }
+                    self.on_run_cherry_pick();
                 }
                 if ui.button("Abort cherry-pick").clicked() {
                     self.run_git_command_static(&["cherry-pick", "--abort"]);
@@ -1419,14 +1668,7 @@ impl VcsGuiApp {
                 );
             }
             if ui.button("Run reset").clicked() {
-                match build_reset_args(
-                    self.history_form.reset_target.trim(),
-                    self.history_form.reset_mode,
-                    self.history_form.confirm_hard_reset,
-                ) {
-                    Ok(args) => self.run_git_command(&args),
-                    Err(err) => self.action_output = err,
-                }
+                self.on_run_reset();
             }
 
             ui.separator();
@@ -1523,27 +1765,10 @@ impl VcsGuiApp {
             });
             ui.horizontal(|ui| {
                 if ui.button("Apply config").clicked() {
-                    match build_consensus_config_args(
-                        self.consensus_form.threshold.trim(),
-                        self.consensus_form.members_csv.trim(),
-                        false,
-                    ) {
-                        Ok(args) => self.run_vcs_command(&args),
-                        Err(err) => self.action_output = err,
-                    }
+                    self.on_apply_consensus_config(false);
                 }
                 if ui.button("Clear members").clicked() {
-                    match build_consensus_config_args(
-                        self.consensus_form.threshold.trim(),
-                        "",
-                        true,
-                    ) {
-                        Ok(args) => {
-                            self.run_vcs_command(&args);
-                            self.consensus_form.members_csv.clear();
-                        }
-                        Err(err) => self.action_output = err,
-                    }
+                    self.on_apply_consensus_config(true);
                 }
                 if ui.button("Load current").clicked() {
                     self.consensus_form.threshold =
@@ -1580,19 +1805,7 @@ impl VcsGuiApp {
                 ui.label("Peer URL");
                 ui.add(TextEdit::singleline(&mut self.peer_form.peer_url).desired_width(280.0));
                 if ui.button("Add peer").clicked() {
-                    let peer = self.peer_form.peer_url.trim().to_string();
-                    if !peer.is_empty() {
-                        self.run_vcs_command(&vec![
-                            "peer".to_string(),
-                            "add".to_string(),
-                            peer.clone(),
-                        ]);
-                        if !self.action_output.starts_with("command failed:") {
-                            self.peer_form.peer_url.clear();
-                        }
-                    } else {
-                        self.action_output = "peer URL cannot be empty".to_string();
-                    }
+                    self.on_add_peer();
                 }
             });
 
@@ -1615,7 +1828,7 @@ impl VcsGuiApp {
                     }
                 });
             if let Some(peer) = peer_to_remove {
-                self.run_vcs_command(&vec!["peer".to_string(), "remove".to_string(), peer]);
+                self.on_remove_peer(peer);
             }
         });
     }
@@ -1625,16 +1838,13 @@ impl VcsGuiApp {
             ui.heading("Actions");
             ui.horizontal(|ui| {
                 if ui.button("Sync now").clicked() {
-                    self.run_vcs_command(&vec!["sync".to_string()]);
+                    self.on_sync_now();
                 }
                 if ui.button("Process pending pushes").clicked() {
-                    self.run_vcs_command(&vec![
-                        "push".to_string(),
-                        "--process-pending".to_string(),
-                    ]);
+                    self.on_process_pending_pushes();
                 }
                 if ui.button("List pending queue").clicked() {
-                    self.run_vcs_command(&vec!["push".to_string(), "--list-pending".to_string()]);
+                    self.on_list_pending_queue();
                 }
             });
 
@@ -1659,30 +1869,7 @@ impl VcsGuiApp {
                 ui.add(TextEdit::singleline(&mut self.propose_form.ttl_hours).desired_width(100.0));
             });
             if ui.button("Propose").clicked() {
-                let mut args = vec![
-                    "consensus".to_string(),
-                    "propose".to_string(),
-                    "--ref".to_string(),
-                    self.propose_form.reference.trim().to_string(),
-                    "--new".to_string(),
-                    self.propose_form.new_oid.trim().to_string(),
-                ];
-                let old_oid = self.propose_form.old_oid.trim();
-                if !old_oid.is_empty() {
-                    args.push("--old".to_string());
-                    args.push(old_oid.to_string());
-                }
-                let epoch = self.propose_form.epoch.trim();
-                if !epoch.is_empty() {
-                    args.push("--epoch".to_string());
-                    args.push(epoch.to_string());
-                }
-                let ttl = self.propose_form.ttl_hours.trim();
-                if !ttl.is_empty() {
-                    args.push("--ttl".to_string());
-                    args.push(format!("{ttl}h"));
-                }
-                self.run_vcs_command(&args);
+                self.on_propose();
             }
 
             ui.separator();
@@ -1697,34 +1884,13 @@ impl VcsGuiApp {
             });
             ui.horizontal(|ui| {
                 if ui.button("Cast vote").clicked() {
-                    let mut args = vec![
-                        "consensus".to_string(),
-                        "vote".to_string(),
-                        "--proposal".to_string(),
-                        self.vote_form.proposal_id.trim().to_string(),
-                    ];
-                    args.push(if self.vote_form.vote_yes {
-                        "--yes".to_string()
-                    } else {
-                        "--no".to_string()
-                    });
-                    self.run_vcs_command(&args);
+                    self.on_cast_vote();
                 }
                 if ui.button("Certify").clicked() {
-                    self.run_vcs_command(&vec![
-                        "consensus".to_string(),
-                        "certify".to_string(),
-                        "--proposal".to_string(),
-                        self.vote_form.proposal_id.trim().to_string(),
-                    ]);
+                    self.on_certify();
                 }
                 if ui.button("Status").clicked() {
-                    self.run_vcs_command(&vec![
-                        "consensus".to_string(),
-                        "status".to_string(),
-                        "--proposal".to_string(),
-                        self.vote_form.proposal_id.trim().to_string(),
-                    ]);
+                    self.on_consensus_status();
                 }
             });
         });
@@ -2883,7 +3049,17 @@ fn load_gossip_data(repo: &Path) -> Result<GossipData, String> {
         return Ok(GossipData::default());
     }
 
-    let identity: Option<IdentityFile> = read_json_if_exists(&root.join("identity.json"))?;
+    let mut identity: Option<IdentityFile> = read_json_if_exists(&root.join("identity.json"))?;
+    if identity.is_none() {
+        if let Some(global_path) = resolve_global_identity_path(repo) {
+            identity = read_json_if_exists(&global_path)?;
+        }
+    }
+    if identity.is_none() {
+        if let Some(legacy_global_path) = resolve_legacy_global_identity_path() {
+            identity = read_json_if_exists(&legacy_global_path)?;
+        }
+    }
     let peers: Option<PeersFile> = read_json_if_exists(&root.join("peers.json"))?;
     let config: Option<ConsensusConfigFile> = read_json_if_exists(&root.join("consensus.json"))?;
     let pending: Option<PendingPushFile> = read_json_if_exists(&root.join("pending_pushes.json"))?;
@@ -3096,6 +3272,80 @@ fn default_vcs_binary(repo_root: PathBuf) -> PathBuf {
     }
 }
 
+fn repo_identity_key(repo: &Path) -> String {
+    let mut normalized = repo.to_path_buf();
+    if let Ok(canonical) = repo.canonicalize() {
+        normalized = canonical;
+    } else if !repo.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            normalized = cwd.join(repo);
+        }
+    }
+
+    let mut input = normalized.to_string_lossy().to_string();
+    if cfg!(target_os = "windows") {
+        input = input.to_lowercase();
+    }
+    let digest = Sha256::digest(input.as_bytes());
+    format!("{digest:x}")
+}
+
+fn resolve_config_base_dir() -> Option<PathBuf> {
+    if let Some(override_dir) = std::env::var_os("VCS_IDENTITY_DIR") {
+        let path = PathBuf::from(override_dir);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+
+    let config_dir = if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+        })
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    }?;
+
+    Some(config_dir.join("vcs").join("gossip").join("identities"))
+}
+
+fn resolve_global_identity_path(repo: &Path) -> Option<PathBuf> {
+    let key = repo_identity_key(repo);
+    let base = resolve_config_base_dir()?;
+    Some(base.join(key).join("identity.json"))
+}
+
+fn resolve_legacy_global_identity_path() -> Option<PathBuf> {
+    if let Some(override_dir) = std::env::var_os("VCS_IDENTITY_DIR") {
+        let path = PathBuf::from(override_dir);
+        if !path.as_os_str().is_empty() {
+            return Some(path.join("identity.json"));
+        }
+    }
+
+    let config_dir = if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+        })
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    }?;
+
+    Some(config_dir.join("vcs").join("gossip").join("identity.json"))
+}
+
 fn parse_ts(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
@@ -3125,6 +3375,346 @@ fn non_empty(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedCommand {
+        program: String,
+        args: Vec<String>,
+        cwd: String,
+        envs: Vec<(String, String)>,
+    }
+
+    #[derive(Default)]
+    struct FakeCommandRunner {
+        calls: Mutex<Vec<RecordedCommand>>,
+        responses: Mutex<VecDeque<Result<CommandExecution, String>>>,
+    }
+
+    impl FakeCommandRunner {
+        fn push_result(&self, result: Result<CommandExecution, String>) {
+            self.responses
+                .lock()
+                .expect("responses mutex")
+                .push_back(result);
+        }
+
+        fn push_success(&self, stdout: &str) {
+            self.push_result(Ok(CommandExecution {
+                success: true,
+                status_code: Some(0),
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            }));
+        }
+
+        fn push_failure(&self, stderr: &str) {
+            self.push_result(Ok(CommandExecution {
+                success: false,
+                status_code: Some(1),
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            }));
+        }
+
+        fn take_calls(&self) -> Vec<RecordedCommand> {
+            std::mem::take(&mut *self.calls.lock().expect("calls mutex"))
+        }
+    }
+
+    impl CommandRunner for FakeCommandRunner {
+        fn run(
+            &self,
+            program: &str,
+            args: &[String],
+            cwd: &str,
+            envs: &[(String, String)],
+        ) -> Result<CommandExecution, String> {
+            self.calls
+                .lock()
+                .expect("calls mutex")
+                .push(RecordedCommand {
+                    program: program.to_string(),
+                    args: args.to_vec(),
+                    cwd: cwd.to_string(),
+                    envs: envs.to_vec(),
+                });
+
+            if let Some(result) = self.responses.lock().expect("responses mutex").pop_front() {
+                return result;
+            }
+
+            Ok(CommandExecution {
+                success: true,
+                status_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn test_app(fake: &Arc<FakeCommandRunner>) -> VcsGuiApp {
+        VcsGuiApp::new_for_tests(fake.clone())
+    }
+
+    fn assert_single_call(fake: &Arc<FakeCommandRunner>, program: &str, args: &[&str]) {
+        let calls = fake.take_calls();
+        assert_eq!(calls.len(), 1, "expected exactly one command invocation");
+        let call = &calls[0];
+        assert_eq!(call.program, program);
+        assert_eq!(
+            call.args,
+            args.iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn handler_stage_all_dispatches_vcs_stage() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+
+        app.on_stage_all();
+
+        assert_single_call(&fake, "vcs", &["stage"]);
+        assert_eq!(app.action_output, "vcs command completed");
+    }
+
+    #[test]
+    fn handler_stage_file_requires_selection() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+        app.git_form.selected_diff_file.clear();
+
+        app.on_stage_file();
+
+        assert_eq!(fake.take_calls().len(), 0);
+        assert_eq!(app.action_output, "Select a file to stage");
+    }
+
+    #[test]
+    fn handler_stage_file_dispatches_selected_path() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+        app.git_form.selected_diff_file = "README.md".to_string();
+
+        app.on_stage_file();
+
+        assert_single_call(&fake, "vcs", &["stage", "README.md"]);
+    }
+
+    #[test]
+    fn handler_commit_dispatches_with_message() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+        app.git_form.commit_message = "ship".to_string();
+
+        app.on_commit(false);
+
+        assert_single_call(&fake, "vcs", &["commit", "-m", "ship"]);
+    }
+
+    #[test]
+    fn handler_commit_validates_empty_message() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+        app.git_form.commit_message.clear();
+
+        app.on_commit(false);
+
+        assert_eq!(fake.take_calls().len(), 0);
+        assert_eq!(app.action_output, "Commit message cannot be empty");
+    }
+
+    #[test]
+    fn handler_push_immediate_dispatches_flag() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+
+        app.on_push(true);
+
+        assert_single_call(&fake, "vcs", &["push", "--no-auto-proposal"]);
+    }
+
+    #[test]
+    fn handler_start_merge_uses_git() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+        app.merge_form.merge_target = "feature/a".to_string();
+
+        app.on_start_merge();
+
+        assert_single_call(&fake, "git", &["merge", "feature/a"]);
+    }
+
+    #[test]
+    fn handler_run_rebase_uses_git_and_flags() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+        app.history_form.rebase_onto = "main".to_string();
+        app.history_form.rebase_autosquash = true;
+        app.history_form.rebase_merges = true;
+
+        app.on_run_rebase();
+
+        assert_single_call(
+            &fake,
+            "git",
+            &["rebase", "--autosquash", "--rebase-merges", "main"],
+        );
+    }
+
+    #[test]
+    fn handler_run_reset_hard_requires_confirmation() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+        app.history_form.reset_target = "HEAD~1".to_string();
+        app.history_form.reset_mode = ResetMode::Hard;
+        app.history_form.confirm_hard_reset = false;
+
+        app.on_run_reset();
+
+        assert_eq!(fake.take_calls().len(), 0);
+        assert_eq!(app.action_output, "Confirm hard reset before running it");
+    }
+
+    #[test]
+    fn handler_apply_consensus_config_dispatches_and_clears_members() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+        app.consensus_form.threshold = "0.75".to_string();
+        app.consensus_form.members_csv = "nodeA,nodeB".to_string();
+
+        app.on_apply_consensus_config(true);
+
+        assert_single_call(
+            &fake,
+            "vcs",
+            &[
+                "consensus",
+                "config",
+                "--threshold",
+                "0.75",
+                "--clear-members",
+            ],
+        );
+        assert!(app.consensus_form.members_csv.is_empty());
+    }
+
+    #[test]
+    fn handler_add_peer_validates_empty_input() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+        app.peer_form.peer_url.clear();
+
+        app.on_add_peer();
+
+        assert_eq!(fake.take_calls().len(), 0);
+        assert_eq!(app.action_output, "peer URL cannot be empty");
+    }
+
+    #[test]
+    fn handler_add_peer_keeps_value_on_failure() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        fake.push_failure("network unavailable");
+        let mut app = test_app(&fake);
+        app.peer_form.peer_url = "http://127.0.0.1:9901".to_string();
+
+        app.on_add_peer();
+
+        assert_single_call(&fake, "vcs", &["peer", "add", "http://127.0.0.1:9901"]);
+        assert_eq!(app.peer_form.peer_url, "http://127.0.0.1:9901");
+        assert_eq!(app.action_output, "vcs command failed: network unavailable");
+    }
+
+    #[test]
+    fn handler_add_peer_clears_value_on_success() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        fake.push_success("peer added");
+        let mut app = test_app(&fake);
+        app.peer_form.peer_url = "http://127.0.0.1:9901".to_string();
+
+        app.on_add_peer();
+
+        assert_single_call(&fake, "vcs", &["peer", "add", "http://127.0.0.1:9901"]);
+        assert_eq!(app.peer_form.peer_url, "");
+        assert_eq!(app.action_output, "peer added");
+    }
+
+    #[test]
+    fn handler_propose_builds_expected_args_with_optional_fields() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+        app.propose_form.reference = "refs/heads/main".to_string();
+        app.propose_form.new_oid = "abc".to_string();
+        app.propose_form.old_oid = "def".to_string();
+        app.propose_form.epoch = "3".to_string();
+        app.propose_form.ttl_hours = "12".to_string();
+
+        app.on_propose();
+
+        assert_single_call(
+            &fake,
+            "vcs",
+            &[
+                "consensus",
+                "propose",
+                "--ref",
+                "refs/heads/main",
+                "--new",
+                "abc",
+                "--old",
+                "def",
+                "--epoch",
+                "3",
+                "--ttl",
+                "12h",
+            ],
+        );
+    }
+
+    #[test]
+    fn handler_cast_vote_dispatches_no_vote() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+        app.vote_form.proposal_id = "proposal-1".to_string();
+        app.vote_form.vote_yes = false;
+
+        app.on_cast_vote();
+
+        assert_single_call(
+            &fake,
+            "vcs",
+            &["consensus", "vote", "--proposal", "proposal-1", "--no"],
+        );
+    }
+
+    #[test]
+    fn cli_input_dispatches_allowed_command_with_quotes() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+        app.cli_input = "vcs commit -m \"hello world\"".to_string();
+
+        app.run_cli_input_command();
+
+        assert_single_call(&fake, "vcs", &["commit", "-m", "hello world"]);
+    }
+
+    #[test]
+    fn cli_input_rejects_disallowed_command() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut app = test_app(&fake);
+        app.cli_input = "rm -rf .".to_string();
+
+        app.run_cli_input_command();
+
+        assert_eq!(fake.take_calls().len(), 0);
+        assert!(app
+            .action_output
+            .contains("is not allowed in GUI CLI input"));
+    }
 
     #[test]
     fn commit_args_include_message() {

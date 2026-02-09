@@ -81,9 +81,13 @@ The CLI now includes a decentralized gossip layer on top of the Git-compatible c
 
 ### Storage
 
-Repo-local decentralized metadata is stored in:
+Decentralized metadata is stored in:
 
-- `.vcs/gossip/identity.json` (ed25519 node identity)
+- OS-specific user config path for node identity (ed25519):
+  - Linux: `$XDG_CONFIG_HOME/vcs/gossip/identities/<repo-hash>/identity.json` (or `~/.config/...`)
+  - macOS: `~/Library/Application Support/vcs/gossip/identities/<repo-hash>/identity.json`
+  - Windows: `%APPDATA%\\vcs\\gossip\\identities\\<repo-hash>\\identity.json`
+  - Optional override base directory: `VCS_IDENTITY_DIR`
 - `.vcs/gossip/peers.json` (peer list)
 - `.vcs/gossip/ops.log` (signed operation log)
 - `.vcs/gossip/pending_pushes.json` (local pending push queue)

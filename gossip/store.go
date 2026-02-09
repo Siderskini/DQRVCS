@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -25,6 +26,10 @@ const (
 	identityFileName = "identity.json"
 	peersFileName    = "peers.json"
 	opsFileName      = "ops.log"
+
+	identityDirEnvVar = "VCS_IDENTITY_DIR"
+	appConfigDirName  = "vcs"
+	identitiesDirName = "identities"
 )
 
 // Identity represents a node identity used to sign gossip operations.
@@ -68,6 +73,7 @@ type Store struct {
 }
 
 // OpenStore opens or creates a repo-local gossip metadata store.
+// Identity key material is stored in a user-level config directory.
 func OpenStore(repoRoot string) (*Store, error) {
 	repoRoot = strings.TrimSpace(repoRoot)
 	if repoRoot == "" {
@@ -98,6 +104,51 @@ func OpenStore(repoRoot string) (*Store, error) {
 	}
 
 	return s, nil
+}
+
+func identityKeyForRepo(repoRoot string) string {
+	repoRoot = strings.TrimSpace(repoRoot)
+	if repoRoot == "" {
+		return "default"
+	}
+
+	if abs, err := filepath.Abs(repoRoot); err == nil {
+		repoRoot = abs
+	}
+	repoRoot = filepath.Clean(repoRoot)
+	if runtime.GOOS == "windows" {
+		repoRoot = strings.ToLower(repoRoot)
+	}
+
+	sum := sha256.Sum256([]byte(repoRoot))
+	return hex.EncodeToString(sum[:])
+}
+
+func resolveLegacyGlobalIdentityPath() (string, error) {
+	if override := strings.TrimSpace(os.Getenv(identityDirEnvVar)); override != "" {
+		return filepath.Join(override, identityFileName), nil
+	}
+
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user config dir: %w", err)
+	}
+	return filepath.Join(configDir, appConfigDirName, gossipDirName, identityFileName), nil
+}
+
+func resolveGlobalIdentityPath(repoRoot string) (string, error) {
+	var baseDir string
+	if override := strings.TrimSpace(os.Getenv(identityDirEnvVar)); override != "" {
+		baseDir = override
+	} else {
+		configDir, err := os.UserConfigDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve user config dir: %w", err)
+		}
+		baseDir = filepath.Join(configDir, appConfigDirName, gossipDirName, identitiesDirName)
+	}
+
+	return filepath.Join(baseDir, identityKeyForRepo(repoRoot), identityFileName), nil
 }
 
 // NodeID returns the local node ID.
@@ -482,19 +533,79 @@ func (s *Store) appendOpLocked(op Operation) error {
 }
 
 func (s *Store) loadIdentity() error {
-	path := filepath.Join(s.dir, identityFileName)
+	legacyPath := filepath.Join(s.dir, identityFileName)
+	globalPath, globalPathErr := resolveGlobalIdentityPath(s.repoRoot)
+	legacyGlobalPath, legacyGlobalPathErr := resolveLegacyGlobalIdentityPath()
+
+	if globalPathErr == nil {
+		loaded, err := s.loadIdentityFromPath(globalPath)
+		if err != nil {
+			return err
+		}
+		if loaded {
+			return nil
+		}
+	}
+	if legacyGlobalPathErr == nil && legacyGlobalPath != globalPath {
+		loaded, err := s.loadIdentityFromPath(legacyGlobalPath)
+		if err != nil {
+			return err
+		}
+		if loaded {
+			// Best-effort migration from legacy global identity path to repo-keyed location.
+			if globalPathErr == nil {
+				if err := os.MkdirAll(filepath.Dir(globalPath), 0o700); err == nil {
+					_ = writeJSONAtomic(globalPath, s.identity, 0o600)
+				}
+			}
+			return nil
+		}
+	}
+
+	loadedLegacy, err := s.loadIdentityFromPath(legacyPath)
+	if err != nil {
+		return err
+	}
+	if loadedLegacy {
+		// Best-effort migration from legacy repo-local identity path to global config.
+		if globalPathErr == nil {
+			if err := os.MkdirAll(filepath.Dir(globalPath), 0o700); err == nil {
+				_ = writeJSONAtomic(globalPath, s.identity, 0o600)
+			}
+		}
+		return nil
+	}
+
+	targetPath := legacyPath
+	if globalPathErr == nil {
+		targetPath = globalPath
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
+			return fmt.Errorf("create identity dir: %w", err)
+		}
+	}
+	return s.generateIdentity(targetPath)
+}
+
+func (s *Store) loadIdentityFromPath(path string) (bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return s.generateIdentity(path)
+			return false, nil
 		}
-		return fmt.Errorf("read identity file: %w", err)
+		return false, fmt.Errorf("read identity file %s: %w", path, err)
 	}
 
 	var identity Identity
 	if err := json.Unmarshal(data, &identity); err != nil {
-		return fmt.Errorf("decode identity file: %w", err)
+		return false, fmt.Errorf("decode identity file %s: %w", path, err)
 	}
+	if err := s.applyIdentity(identity); err != nil {
+		return false, fmt.Errorf("load identity file %s: %w", path, err)
+	}
+	return true, nil
+}
+
+func (s *Store) applyIdentity(identity Identity) error {
 	pubBytes, err := base64.StdEncoding.DecodeString(identity.PublicKey)
 	if err != nil {
 		return fmt.Errorf("decode identity public key: %w", err)

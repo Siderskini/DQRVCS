@@ -119,7 +119,11 @@ The GUI middle area is organized into tabs. Top and bottom panels remain fixed.
 
 3. `Collaboration` tab
 - `Node + Peers` panel
-- Local node ID from `.vcs/gossip/identity.json`
+- Local node ID from OS-specific identity path:
+  - Linux: `$XDG_CONFIG_HOME/vcs/gossip/identities/<repo-hash>/identity.json` (or `~/.config/...`)
+  - macOS: `~/Library/Application Support/vcs/gossip/identities/<repo-hash>/identity.json`
+  - Windows: `%APPDATA%\\vcs\\gossip\\identities\\<repo-hash>\\identity.json`
+  - Optional override base directory: `VCS_IDENTITY_DIR`
 - Consensus threshold and configured member count
 - Current peer list from `.vcs/gossip/peers.json`
 - Peer management controls:
@@ -288,9 +292,9 @@ Color semantics:
 
 ## 7. Data Files Used by GUI
 
-The GUI reads these repo-local files:
+The GUI reads these files:
 
-- `.vcs/gossip/identity.json`
+- OS-specific identity file (`.../vcs/gossip/identities/<repo-hash>/identity.json`)
 - `.vcs/gossip/peers.json`
 - `.vcs/gossip/consensus.json` (if present)
 - `.vcs/gossip/pending_pushes.json`
@@ -313,7 +317,7 @@ It also runs Git commands in the selected repository path for branch/HEAD/status
 ## 8.3 No proposals/pending/ops visible
 
 - Confirm you are pointing to the intended repository.
-- Confirm `.vcs/gossip/*` files exist there.
+- Confirm `.vcs/gossip/*` files exist there, and identity exists in the OS config path.
 - Click `Refresh` or reduce auto-refresh interval.
 
 ## 8.4 Git HEAD errors on new repos

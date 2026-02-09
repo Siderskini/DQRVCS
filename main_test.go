@@ -14,6 +14,18 @@ import (
 	"vcs/gossip"
 )
 
+func TestMain(m *testing.M) {
+	identityDir, err := os.MkdirTemp("", "vcs-tests-identity-*")
+	if err != nil {
+		panic(err)
+	}
+	_ = os.Setenv("VCS_IDENTITY_DIR", filepath.Join(identityDir, "vcs", "gossip"))
+
+	code := m.Run()
+	_ = os.RemoveAll(identityDir)
+	os.Exit(code)
+}
+
 func stubGitFns(
 	t *testing.T,
 	runFn func(args ...string) error,
@@ -125,12 +137,21 @@ func TestCmdCheckoutRequiresTarget(t *testing.T) {
 
 func TestCmdPushAndPullPassThroughArgs(t *testing.T) {
 	var got [][]string
+	repo := t.TempDir()
 	stubGitFns(t, func(args ...string) error {
 		got = append(got, append([]string(nil), args...))
 		return nil
-	}, nil)
+	}, func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "rev-parse" && args[1] == "--show-toplevel" {
+			return repo, nil
+		}
+		if len(args) >= 2 && args[0] == "rev-parse" && args[1] == "--verify" {
+			return "deadbeef", nil
+		}
+		return "", nil
+	})
 
-	if err := cmdPush([]string{"origin", "main"}); err != nil {
+	if err := cmdPush([]string{"--no-auto-proposal", "origin", "main"}); err != nil {
 		t.Fatalf("cmdPush returned error: %v", err)
 	}
 	if err := cmdPull([]string{"origin", "main"}); err != nil {

@@ -3,7 +3,10 @@ package gossip
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -26,6 +29,30 @@ func TestOpenStoreIdentityPersists(t *testing.T) {
 	id2 := s2.IdentityPublic()
 	if id1.NodeID != id2.NodeID || id1.PublicKey != id2.PublicKey {
 		t.Fatalf("identity did not persist: first=%+v second=%+v", id1, id2)
+	}
+}
+
+func TestOpenStoreWritesIdentityToConfiguredGlobalPath(t *testing.T) {
+	root := t.TempDir()
+	identityRoot := t.TempDir()
+	t.Setenv(identityDirEnvVar, identityRoot)
+
+	_, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	globalIdentity, err := resolveGlobalIdentityPath(root)
+	if err != nil {
+		t.Fatalf("resolve global identity path: %v", err)
+	}
+	if _, err := os.Stat(globalIdentity); err != nil {
+		t.Fatalf("expected global identity file at %s: %v", globalIdentity, err)
+	}
+
+	legacyIdentity := filepath.Join(root, metadataDirName, gossipDirName, identityFileName)
+	if _, err := os.Stat(legacyIdentity); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected no legacy identity file at %s, got err=%v", legacyIdentity, err)
 	}
 }
 
