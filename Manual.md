@@ -1,0 +1,406 @@
+# VCS GUI User Manual
+
+## 1. Purpose
+This manual explains how to use the Rust GUI for the VCS project (`gui/`), including:
+
+- Setup and launch
+- UI sections and controls
+- Direct Git operations from the GUI
+- Interactive merge/conflict resolution controls
+- Advanced history tools (rebase/cherry-pick/reset/reflog)
+- Interactive rebase todo-list editing
+- Restricted inline VCS CLI command input
+- Diff and branch graph views
+- Peer management
+- Proposal and vote workflows
+- Consensus config editing
+- Pending push processing
+- Troubleshooting common errors
+
+The GUI is a desktop operator for the existing `vcs` CLI and `.vcs/gossip` data model.
+
+## 2. Prerequisites
+
+Before launching the GUI, ensure:
+
+- You are in a valid local Git repository.
+- The `vcs` CLI binary exists and is executable.
+- Rust toolchain is installed (`cargo` available).
+
+Recommended from repo root:
+
+```bash
+go build -o vcs .
+cargo run --manifest-path gui/Cargo.toml
+```
+
+Optional release build:
+
+```bash
+cargo build --release --manifest-path gui/Cargo.toml
+```
+
+## 3. Starting the GUI
+
+Launch:
+
+```bash
+cargo run --manifest-path gui/Cargo.toml
+```
+
+On startup, the app attempts to auto-detect:
+
+- Repository path (usually this repo root)
+- `vcs` binary path (defaults to `./vcs` if present)
+
+If either is wrong, update it in the top control bar.
+
+## 4. Top Control Bar
+
+The top row contains:
+
+- `Repository`: Filesystem path used for Git and `.vcs/gossip` reads.
+- `vcs binary`: Path to the CLI executable used for action buttons.
+- `Refresh`: Manual refresh of all UI data.
+- `Auto refresh`: Enables periodic refresh.
+- `every Ns`: Auto-refresh interval (1s to 60s).
+
+If loading fails, an error appears in red directly below this bar.
+
+## 5. Screen Layout
+
+The GUI middle area is organized into tabs. Top and bottom panels remain fixed.
+
+### Tabs
+
+1. `Staging` tab
+- `Repository` panel
+- Current branch
+- Current `HEAD` short hash
+- Working tree summary and status lines (`git status --short`)
+- If repo has no commits yet, `HEAD` shows `(no commits yet)`
+
+- `Git Operations` panel
+- Stage/unstage all files
+- Stage/unstage the selected file from status list
+- Commit / commit all with message
+- Amend (`--no-edit` when message is empty, `-m` when provided)
+- Checkout target branch/ref
+- Revert commit (normal and `--no-commit`)
+- Pull, push (consensus-enabled), push immediate (`--no-auto-proposal`)
+- Squash support (`--last` or `--from`, with message and optional `--allow-dirty`)
+
+- `Diff` panel
+- Working-tree vs staged diff toggle
+- Scope tied to selected status file (or all changed files)
+- Manual `Reload diff` refresh
+
+2. `Advanced` tab
+- `Advanced History` panel
+- `Merge + Conflict Resolution` panel
+- Start merge with a target branch/ref
+- Live merge/rebase/cherry-pick in-progress indicators
+- Continue/abort controls for merge/rebase/cherry-pick
+- Conflict file picker with:
+  - `Use ours`
+  - `Use theirs`
+  - `Mark resolved (add)`
+  - `Load in Diff panel`
+- Line-by-line conflict editor:
+  - Load conflicted file into editor
+  - Select `ours`/`theirs` per line inside each conflict hunk
+  - Apply bulk choice (`Use ours/theirs for all hunks`)
+  - Save resolved file directly from the editor
+- Optional explicit merge commit message action
+- `Branch Graph` panel
+- Text graph from:
+  - `git log --graph --decorate --oneline --all -n 120`
+- Shows `(no commits yet)` for unborn repos
+
+3. `Collaboration` tab
+- `Node + Peers` panel
+- Local node ID from `.vcs/gossip/identity.json`
+- Consensus threshold and configured member count
+- Current peer list from `.vcs/gossip/peers.json`
+- Peer management controls:
+  - `Peer URL` input
+  - `Add peer` button (`vcs peer add <url>`)
+  - `Remove` button beside each peer (`vcs peer remove <url>`)
+
+- `Consensus Config` panel
+- Edit threshold value
+- Edit members as comma-separated node IDs
+- `Apply config` runs `vcs consensus config --threshold ... [--members ...]`
+- `Clear members` runs `--clear-members`
+- `Load current` fills form from currently loaded config
+
+- `Actions` panel
+- `Sync now` (`vcs sync`)
+- `Process pending pushes` (`vcs push --process-pending`)
+- `List pending queue` (`vcs push --list-pending`)
+
+Create proposal form:
+- `Ref`, `New OID`, optional `Old OID`, `Epoch`, `TTL (hours)`
+- `Propose` button (`vcs consensus propose ...`)
+
+Vote/certify form:
+- `Proposal ID`
+- Vote choice: `Yes` or `No`
+- `Cast vote` (`vcs consensus vote --proposal ... --yes|--no`)
+- `Certify` (`vcs consensus certify --proposal ...`)
+- `Status` (`vcs consensus status --proposal ...`)
+
+- `Proposals` panel
+- Aggregated view from `consensus.proposal`, `consensus.vote`, `consensus.cert` ops
+- Shows:
+  - Proposal ID
+  - Ref, old/new OIDs
+  - Yes/no counts
+  - Voter count, required yes count
+  - Epoch, proposer, timestamps, expiry
+  - Quorum and certified flags
+- `Use ID` button copies proposal ID into Vote form
+
+Color semantics:
+- Green: certified
+- Yellow-green: quorum reached but not certified
+- Yellow: pending
+- Red: expired
+
+- `Pending Pushes` panel
+- Loaded from `.vcs/gossip/pending_pushes.json`
+- Shows proposal ID, remote, target ref, new OID, status, attempts, last error
+
+Color semantics:
+- Green: completed
+- Yellow: pending
+- Red: failed
+
+- `Operation Feed` panel
+- Reverse chronological feed from `.vcs/gossip/ops.log`
+- Displays timestamp, sequence, type, author, op ID
+
+### Bottom
+
+`Last Command Output`:
+
+- Output or error from the latest button action.
+- Use this first when troubleshooting action failures.
+
+`Run VCS CLI Command`:
+
+- Single-line command input below output panel.
+- Accepts only VCS command set (`init`, `status`, `log`, `branch`, `checkout`, `stage`, `unstage`, `commit`, `amend`, `revert`, `push`, `pull`, `squash`, `peer`, `op`, `sync`, `daemon`, `consensus`, `help`).
+- Supports quoted arguments (for example `commit -m "message here"`).
+
+## 6. Core Workflows
+
+## 6.1 Add/Remove Peers
+
+1. Open `Node + Peers`.
+2. Enter peer URL (example: `http://127.0.0.1:8788`).
+3. Click `Add peer`.
+4. To remove, click `Remove` next to the peer entry.
+
+## 6.2 Stage, Commit, and Push
+
+1. In `Git Operations`, click `Stage all` or `Stage file`.
+2. Enter commit message and click `Commit` (or `Commit all`).
+3. Click `Push` for consensus-aware push workflow.
+4. Use `Push immediate` only when you explicitly want to bypass auto-proposal.
+
+## 6.3 Review Diffs and Graph
+
+1. Choose file from `Git Operations` combo.
+2. In `Diff`, switch between `Working tree` and `Staged`.
+3. Click `Reload diff` when needed.
+4. Review `Branch Graph` for recent topology and refs.
+
+## 6.4 Resolve Merge Conflicts
+
+1. In `Merge + Conflict Resolution`, enter merge target and click `Start merge`.
+2. If conflicts appear, choose a conflict file.
+3. Use `Use ours` or `Use theirs`, then `Mark resolved (add)`.
+4. Use `Load in Diff panel` to inspect file-level diff during resolution.
+5. Open `Line-by-line Conflict Editor`, choose `ours`/`theirs` per line, and save.
+6. Click `Mark resolved (add)` when finished.
+7. Click `Continue` when conflicts are resolved, or `Abort merge` to roll back.
+
+## 6.5 Use Advanced History Tools
+
+1. Use `Recent commit` to pick a baseline commit.
+2. Rebase:
+- Set `Onto`, optional flags, then `Run rebase`.
+- Use `Continue rebase` / `Abort rebase` as needed.
+3. Interactive rebase todo:
+- Click `Generate todo` or `Load current todo`.
+- Edit steps (`pick`, `reword`, `edit`, `squash`, `fixup`, `drop`, etc.).
+- Click `Start from edited todo` to launch `git rebase -i` using the edited list.
+4. Cherry-pick:
+- Enter one or more refs and click `Run cherry-pick`.
+5. Reset:
+- Set target and mode.
+- If mode is hard, check the confirmation box before running.
+6. Reflog:
+- Click `Use` on an entry to fill reset target quickly.
+
+## 6.6 Run Restricted VCS CLI Commands
+
+1. Scroll to bottom and locate `Run VCS CLI Command`.
+2. Enter a command line (optionally prefixed with `vcs`).
+3. Click `Run` or press Enter.
+4. Review output in `Last Command Output`.
+
+## 6.7 Sync Gossip Data
+
+1. Ensure at least one peer is configured.
+2. Click `Sync now`.
+3. Review `Last Command Output`.
+
+## 6.8 Process Pending Pushes
+
+1. Click `List pending queue` to inspect queue state.
+2. Click `Process pending pushes`.
+3. If proposal quorum/certification is satisfied, pending pushes may be applied.
+4. Re-check queue and panel statuses.
+
+## 6.9 Propose, Vote, Certify
+
+1. In `Create Proposal`, fill:
+- Ref (for example `refs/heads/main`)
+- New OID
+- Optional old OID
+- Epoch and TTL
+
+2. Click `Propose`.
+3. In `Proposals`, click `Use ID` on your proposal.
+4. In vote section, choose Yes/No and click `Cast vote`.
+5. Click `Status` to check quorum.
+6. Click `Certify` once quorum is met.
+
+## 6.10 Update Consensus Membership/Threshold
+
+1. Open `Consensus Config`.
+2. Set `Threshold` (in `[0,1)`).
+3. Set optional `Members CSV`.
+4. Click `Apply config`.
+5. Use `Clear members` to return to auto-discovered voters.
+
+## 7. Data Files Used by GUI
+
+The GUI reads these repo-local files:
+
+- `.vcs/gossip/identity.json`
+- `.vcs/gossip/peers.json`
+- `.vcs/gossip/consensus.json` (if present)
+- `.vcs/gossip/pending_pushes.json`
+- `.vcs/gossip/ops.log`
+
+It also runs Git commands in the selected repository path for branch/HEAD/status/diff/log views.
+
+## 8. Troubleshooting
+
+## 8.1 "Both repository path and vcs binary must be set."
+
+- Fill both top-bar fields.
+- Verify `vcs binary` points to a real executable.
+
+## 8.2 "command failed: ... peer ..."
+
+- Ensure URL format is valid (include host/port).
+- Example: `http://127.0.0.1:8788`
+
+## 8.3 No proposals/pending/ops visible
+
+- Confirm you are pointing to the intended repository.
+- Confirm `.vcs/gossip/*` files exist there.
+- Click `Refresh` or reduce auto-refresh interval.
+
+## 8.4 Git HEAD errors on new repos
+
+If repository has no commits, GUI intentionally shows:
+
+- Branch if available
+- `HEAD: (no commits yet)`
+
+Create an initial commit to populate `HEAD`.
+
+## 8.5 Release linker errors (`cc` / `rust-lld` / `.eh_frame`)
+
+This repo already includes Cargo linker configuration:
+
+- `.cargo/config.toml`
+- `gui/.cargo/config.toml`
+
+If your environment overrides them, ensure `cargo` uses repo-local config and retry.
+
+## 9. Current GUI Scope and Limits
+
+Current GUI does:
+
+- Observe repo/gossip state
+- Stage, unstage, commit, amend, revert, checkout, pull, push, and squash through `vcs`
+- Run interactive merge/conflict resolution actions via Git
+- Run advanced history operations (rebase/cherry-pick/reset/reflog assisted)
+- Resolve conflicts line-by-line in a dedicated editor
+- Edit and apply interactive rebase todo lists from GUI
+- Show working-tree and staged diffs
+- Show a branch graph view
+- Manage peers
+- Edit consensus threshold and explicit member list
+- Trigger sync and pending processing
+- Run proposal/vote/cert/status commands
+- Execute restricted VCS CLI commands from inline input
+
+Current GUI does not do:
+
+- Provide a 3-way semantic merge engine (line editor is ours/theirs choice based)
+- Offer drag-and-drop commit graph rewriting beyond todo text editing
+- Integrate the deferred QLS subsystem
+
+Those are still available via CLI.
+
+## 10. Quick Command Equivalents
+
+GUI button | CLI command
+--- | ---
+Stage all | `vcs stage`
+Stage file | `vcs stage <path>`
+Unstage all | `vcs unstage`
+Unstage file | `vcs unstage <path>`
+Commit | `vcs commit -m "<msg>"`
+Commit all | `vcs commit -a -m "<msg>"`
+Amend | `vcs amend --no-edit` or `vcs amend -m "<msg>"`
+Checkout | `vcs checkout <target>`
+Revert | `vcs revert <commit>`
+Revert (--no-commit) | `vcs revert --no-commit <commit>`
+Pull | `vcs pull`
+Push | `vcs push`
+Push immediate | `vcs push --no-auto-proposal`
+Squash | `vcs squash --last N -m "<msg>"` or `vcs squash --from <commit> -m "<msg>"`
+Start merge | `git merge <target>`
+Continue merge | `git merge --continue`
+Abort merge | `git merge --abort`
+Use ours/theirs | `git checkout --ours|--theirs -- <path>`
+Mark resolved | `git add -- <path>`
+Commit merge | `git commit -m "<msg>"`
+Run rebase | `git rebase [--autosquash] [--autostash] [--rebase-merges] <onto>`
+Generate todo | `git log --reverse --pretty="pick %H %s" <onto>..HEAD`
+Start from edited todo | `git rebase -i <onto>` (with GUI-managed sequence editor + todo file)
+Continue rebase | `git rebase --continue`
+Abort rebase | `git rebase --abort`
+Run cherry-pick | `git cherry-pick [--no-commit] <ref...>`
+Abort cherry-pick | `git cherry-pick --abort`
+Run reset | `git reset --soft|--mixed|--hard <target>`
+Inline VCS CLI | `vcs <allowed-command> ...`
+Sync now | `vcs sync`
+Process pending pushes | `vcs push --process-pending`
+List pending queue | `vcs push --list-pending`
+Add peer | `vcs peer add <url>`
+Remove peer | `vcs peer remove <url>`
+Apply consensus config | `vcs consensus config --threshold <t> [--members ...]`
+Clear members | `vcs consensus config --threshold <t> --clear-members`
+Propose | `vcs consensus propose ...`
+Cast vote | `vcs consensus vote --proposal <id> --yes|--no`
+Certify | `vcs consensus certify --proposal <id>`
+Status | `vcs consensus status --proposal <id>`

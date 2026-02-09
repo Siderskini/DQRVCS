@@ -1,0 +1,508 @@
+package gossip
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+)
+
+const (
+	// Generic Git-event op types.
+	OpTypeGitCommit = "git.commit"
+	OpTypeGitPush   = "git.push"
+	OpTypeGitPull   = "git.pull"
+
+	// Consensus-layer op types.
+	OpTypeConsensusProposal = "consensus.proposal"
+	OpTypeConsensusVote     = "consensus.vote"
+	OpTypeConsensusCert     = "consensus.cert"
+
+	consensusFileName = "consensus.json"
+)
+
+// ConsensusConfig controls quorum and voting membership.
+type ConsensusConfig struct {
+	Threshold float64  `json:"threshold"`
+	Members   []string `json:"members,omitempty"`
+}
+
+// ProposalPayload describes a reference update proposal.
+type ProposalPayload struct {
+	ProposalID string `json:"proposal_id"`
+	Ref        string `json:"ref"`
+	OldOID     string `json:"old_oid,omitempty"`
+	NewOID     string `json:"new_oid"`
+	Epoch      uint64 `json:"epoch"`
+	ExpiresAt  string `json:"expires_at,omitempty"`
+}
+
+// VotePayload captures a member vote on a proposal.
+type VotePayload struct {
+	ProposalID string `json:"proposal_id"`
+	Epoch      uint64 `json:"epoch"`
+	Decision   string `json:"decision"` // yes|no
+}
+
+// CertificationPayload records a certification attempt/outcome.
+type CertificationPayload struct {
+	ProposalID  string   `json:"proposal_id"`
+	Epoch       uint64   `json:"epoch"`
+	Threshold   float64  `json:"threshold"`
+	TotalVoters int      `json:"total_voters"`
+	RequiredYes int      `json:"required_yes"`
+	YesVoters   []string `json:"yes_voters"`
+	NoVoters    []string `json:"no_voters"`
+	Certified   bool     `json:"certified"`
+}
+
+// ProposeRefInput is used to create a new ref-update proposal.
+type ProposeRefInput struct {
+	ProposalID string
+	Ref        string
+	OldOID     string
+	NewOID     string
+	Epoch      uint64
+	TTL        time.Duration
+}
+
+// ProposalStatus provides vote/certification status for a proposal.
+type ProposalStatus struct {
+	Proposal       ProposalPayload
+	ProposalOpID   string
+	Proposer       string
+	Threshold      float64
+	Members        []string
+	YesVoters      []string
+	NoVoters       []string
+	RequiredYes    int
+	HasQuorum      bool
+	Expired        bool
+	Certified      bool
+	Certification  *CertificationPayload
+	CertifiedOpID  string
+	VoteCountTotal int
+}
+
+// ProposalSummary is a compact list view entry.
+type ProposalSummary struct {
+	ProposalID string
+	Ref        string
+	NewOID     string
+	Epoch      uint64
+	Proposer   string
+	CreatedAt  string
+}
+
+func defaultConsensusConfig() ConsensusConfig {
+	return ConsensusConfig{
+		Threshold: 0.5,
+		Members:   nil,
+	}
+}
+
+func normalizeConsensusConfig(cfg ConsensusConfig) (ConsensusConfig, error) {
+	if cfg.Threshold == 0 {
+		cfg.Threshold = 0.5
+	}
+	if cfg.Threshold < 0 || cfg.Threshold >= 1 {
+		return cfg, errors.New("threshold must be in [0, 1)")
+	}
+
+	seen := map[string]struct{}{}
+	members := make([]string, 0, len(cfg.Members))
+	for _, member := range cfg.Members {
+		member = strings.TrimSpace(member)
+		if member == "" {
+			continue
+		}
+		if _, ok := seen[member]; ok {
+			continue
+		}
+		seen[member] = struct{}{}
+		members = append(members, member)
+	}
+	sort.Strings(members)
+	cfg.Members = members
+	return cfg, nil
+}
+
+func (s *Store) consensusConfigPath() string {
+	return filepath.Join(s.dir, consensusFileName)
+}
+
+// ConsensusConfig reads consensus configuration from disk (or returns defaults).
+func (s *Store) ConsensusConfig() (ConsensusConfig, error) {
+	cfg := defaultConsensusConfig()
+
+	path := s.consensusConfigPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return cfg, nil
+		}
+		return cfg, fmt.Errorf("read consensus config: %w", err)
+	}
+
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("decode consensus config: %w", err)
+	}
+	cfg, err = normalizeConsensusConfig(cfg)
+	if err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+// SaveConsensusConfig persists consensus configuration and returns normalized result.
+func (s *Store) SaveConsensusConfig(cfg ConsensusConfig) (ConsensusConfig, error) {
+	cfg, err := normalizeConsensusConfig(cfg)
+	if err != nil {
+		return cfg, err
+	}
+	if err := writeJSONAtomic(s.consensusConfigPath(), cfg, 0o644); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+// ProposeRefUpdate appends a new signed proposal operation.
+func (s *Store) ProposeRefUpdate(in ProposeRefInput) (Operation, ProposalPayload, error) {
+	in.Ref = strings.TrimSpace(in.Ref)
+	in.NewOID = strings.TrimSpace(in.NewOID)
+	in.OldOID = strings.TrimSpace(in.OldOID)
+	in.ProposalID = strings.TrimSpace(in.ProposalID)
+
+	if in.Ref == "" {
+		return Operation{}, ProposalPayload{}, errors.New("proposal ref is required")
+	}
+	if in.NewOID == "" {
+		return Operation{}, ProposalPayload{}, errors.New("proposal new OID is required")
+	}
+	if in.ProposalID == "" {
+		generated, err := generateProposalID(s.NodeID(), in.Ref, in.NewOID, in.Epoch)
+		if err != nil {
+			return Operation{}, ProposalPayload{}, err
+		}
+		in.ProposalID = generated
+	}
+
+	payload := ProposalPayload{
+		ProposalID: in.ProposalID,
+		Ref:        in.Ref,
+		OldOID:     in.OldOID,
+		NewOID:     in.NewOID,
+		Epoch:      in.Epoch,
+	}
+	if in.TTL > 0 {
+		payload.ExpiresAt = time.Now().UTC().Add(in.TTL).Format(time.RFC3339Nano)
+	}
+
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return Operation{}, ProposalPayload{}, err
+	}
+	op, err := s.AppendLocalOp(OpTypeConsensusProposal, raw)
+	if err != nil {
+		return Operation{}, ProposalPayload{}, err
+	}
+	return op, payload, nil
+}
+
+// CastVote appends a vote operation for an existing proposal.
+func (s *Store) CastVote(proposalID string, decision string) (Operation, VotePayload, error) {
+	proposalID = strings.TrimSpace(proposalID)
+	decision = strings.ToLower(strings.TrimSpace(decision))
+	if proposalID == "" {
+		return Operation{}, VotePayload{}, errors.New("proposal ID is required")
+	}
+	if decision != "yes" && decision != "no" {
+		return Operation{}, VotePayload{}, errors.New("decision must be yes or no")
+	}
+
+	status, err := s.ProposalStatus(proposalID)
+	if err != nil {
+		return Operation{}, VotePayload{}, err
+	}
+	if status.Expired {
+		return Operation{}, VotePayload{}, errors.New("proposal has expired")
+	}
+
+	payload := VotePayload{
+		ProposalID: proposalID,
+		Epoch:      status.Proposal.Epoch,
+		Decision:   decision,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return Operation{}, VotePayload{}, err
+	}
+	op, err := s.AppendLocalOp(OpTypeConsensusVote, raw)
+	if err != nil {
+		return Operation{}, VotePayload{}, err
+	}
+	return op, payload, nil
+}
+
+// CertifyProposal appends a certification operation if quorum is met (or force=true).
+func (s *Store) CertifyProposal(proposalID string, force bool) (Operation, CertificationPayload, error) {
+	status, err := s.ProposalStatus(proposalID)
+	if err != nil {
+		return Operation{}, CertificationPayload{}, err
+	}
+	if status.CertifiedOpID != "" {
+		return Operation{}, CertificationPayload{}, errors.New("proposal is already certified")
+	}
+	if status.Expired && !force {
+		return Operation{}, CertificationPayload{}, errors.New("proposal has expired")
+	}
+	if !status.HasQuorum && !force {
+		return Operation{}, CertificationPayload{}, fmt.Errorf(
+			"proposal does not have quorum (%d/%d yes, requires %d)",
+			len(status.YesVoters),
+			len(status.Members),
+			status.RequiredYes,
+		)
+	}
+
+	cert := CertificationPayload{
+		ProposalID:  status.Proposal.ProposalID,
+		Epoch:       status.Proposal.Epoch,
+		Threshold:   status.Threshold,
+		TotalVoters: len(status.Members),
+		RequiredYes: status.RequiredYes,
+		YesVoters:   append([]string(nil), status.YesVoters...),
+		NoVoters:    append([]string(nil), status.NoVoters...),
+		Certified:   status.HasQuorum,
+	}
+	raw, err := json.Marshal(cert)
+	if err != nil {
+		return Operation{}, CertificationPayload{}, err
+	}
+	op, err := s.AppendLocalOp(OpTypeConsensusCert, raw)
+	if err != nil {
+		return Operation{}, CertificationPayload{}, err
+	}
+	return op, cert, nil
+}
+
+// ProposalStatus computes voting/quorum/certification status for one proposal.
+func (s *Store) ProposalStatus(proposalID string) (ProposalStatus, error) {
+	proposalID = strings.TrimSpace(proposalID)
+	if proposalID == "" {
+		return ProposalStatus{}, errors.New("proposal ID is required")
+	}
+
+	ops := s.Ops(0)
+	var (
+		proposalOp      Operation
+		proposalPayload ProposalPayload
+		foundProposal   bool
+	)
+	for _, op := range ops {
+		if op.Type != OpTypeConsensusProposal {
+			continue
+		}
+		var payload ProposalPayload
+		if err := decodePayload(op.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.ProposalID == proposalID {
+			proposalOp = op
+			proposalPayload = payload
+			foundProposal = true
+			break
+		}
+	}
+	if !foundProposal {
+		return ProposalStatus{}, fmt.Errorf("proposal %q not found", proposalID)
+	}
+
+	cfg, err := s.ConsensusConfig()
+	if err != nil {
+		return ProposalStatus{}, err
+	}
+
+	members := cfg.Members
+	if len(members) == 0 {
+		memberSet := map[string]struct{}{
+			s.NodeID():             {},
+			proposalOp.Author:      {},
+			proposalPayload.Ref:    {}, // temporary placeholder key, removed below
+			proposalPayload.NewOID: {},
+		}
+		delete(memberSet, proposalPayload.Ref)
+		delete(memberSet, proposalPayload.NewOID)
+		for _, op := range ops {
+			memberSet[op.Author] = struct{}{}
+		}
+		members = make([]string, 0, len(memberSet))
+		for member := range memberSet {
+			if strings.TrimSpace(member) == "" {
+				continue
+			}
+			members = append(members, member)
+		}
+		sort.Strings(members)
+	}
+	memberSet := map[string]struct{}{}
+	for _, member := range members {
+		memberSet[member] = struct{}{}
+	}
+
+	latestVoteByAuthor := map[string]string{}
+	for _, op := range ops {
+		if op.Type != OpTypeConsensusVote {
+			continue
+		}
+		var vote VotePayload
+		if err := decodePayload(op.Payload, &vote); err != nil {
+			continue
+		}
+		if vote.ProposalID != proposalID {
+			continue
+		}
+		if _, allowed := memberSet[op.Author]; !allowed {
+			continue
+		}
+		if vote.Decision != "yes" && vote.Decision != "no" {
+			continue
+		}
+		latestVoteByAuthor[op.Author] = vote.Decision
+	}
+
+	yesVoters := make([]string, 0, len(latestVoteByAuthor))
+	noVoters := make([]string, 0, len(latestVoteByAuthor))
+	for author, decision := range latestVoteByAuthor {
+		switch decision {
+		case "yes":
+			yesVoters = append(yesVoters, author)
+		case "no":
+			noVoters = append(noVoters, author)
+		}
+	}
+	sort.Strings(yesVoters)
+	sort.Strings(noVoters)
+
+	requiredYes := calculateRequiredYes(len(members), cfg.Threshold)
+	hasQuorum := len(yesVoters) >= requiredYes
+
+	expired := false
+	if proposalPayload.ExpiresAt != "" {
+		if ts, err := time.Parse(time.RFC3339Nano, proposalPayload.ExpiresAt); err == nil {
+			expired = time.Now().UTC().After(ts)
+		}
+	}
+
+	var certPayload *CertificationPayload
+	certOpID := ""
+	for _, op := range ops {
+		if op.Type != OpTypeConsensusCert {
+			continue
+		}
+		var cert CertificationPayload
+		if err := decodePayload(op.Payload, &cert); err != nil {
+			continue
+		}
+		if cert.ProposalID != proposalID {
+			continue
+		}
+		copyCert := cert
+		certPayload = &copyCert
+		if cert.Certified {
+			certOpID = op.ID
+		}
+	}
+
+	return ProposalStatus{
+		Proposal:       proposalPayload,
+		ProposalOpID:   proposalOp.ID,
+		Proposer:       proposalOp.Author,
+		Threshold:      cfg.Threshold,
+		Members:        members,
+		YesVoters:      yesVoters,
+		NoVoters:       noVoters,
+		RequiredYes:    requiredYes,
+		HasQuorum:      hasQuorum,
+		Expired:        expired,
+		Certified:      certOpID != "",
+		Certification:  certPayload,
+		CertifiedOpID:  certOpID,
+		VoteCountTotal: len(yesVoters) + len(noVoters),
+	}, nil
+}
+
+// ProposalSummaries lists proposal operations in insertion order.
+func (s *Store) ProposalSummaries(limit int) []ProposalSummary {
+	ops := s.Ops(0)
+	out := make([]ProposalSummary, 0, len(ops))
+	for _, op := range ops {
+		if op.Type != OpTypeConsensusProposal {
+			continue
+		}
+		var payload ProposalPayload
+		if err := decodePayload(op.Payload, &payload); err != nil {
+			continue
+		}
+		out = append(out, ProposalSummary{
+			ProposalID: payload.ProposalID,
+			Ref:        payload.Ref,
+			NewOID:     payload.NewOID,
+			Epoch:      payload.Epoch,
+			Proposer:   op.Author,
+			CreatedAt:  op.Timestamp,
+		})
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out
+}
+
+func decodePayload(raw json.RawMessage, out any) error {
+	if len(raw) == 0 {
+		return errors.New("empty payload")
+	}
+	return json.Unmarshal(raw, out)
+}
+
+func calculateRequiredYes(memberCount int, threshold float64) int {
+	if memberCount <= 0 {
+		return 1
+	}
+	required := int(math.Floor(threshold*float64(memberCount))) + 1
+	if required < 1 {
+		required = 1
+	}
+	if required > memberCount {
+		required = memberCount
+	}
+	return required
+}
+
+func generateProposalID(nodeID, ref, newOID string, epoch uint64) (string, error) {
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return "", fmt.Errorf("generate proposal nonce: %w", err)
+	}
+	h := sha256.New()
+	_, _ = h.Write([]byte(nodeID))
+	_, _ = h.Write([]byte("|"))
+	_, _ = h.Write([]byte(ref))
+	_, _ = h.Write([]byte("|"))
+	_, _ = h.Write([]byte(newOID))
+	_, _ = h.Write([]byte("|"))
+	_, _ = h.Write([]byte(fmt.Sprintf("%d", epoch)))
+	_, _ = h.Write([]byte("|"))
+	_, _ = h.Write(nonce)
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:16]), nil
+}

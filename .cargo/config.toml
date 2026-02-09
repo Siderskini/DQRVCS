@@ -1,0 +1,3 @@
+[target.x86_64-unknown-linux-gnu]
+# Work around rust-lld .eh_frame link failures observed in release builds.
+rustflags = ["-C", "link-arg=-fuse-ld=bfd"]

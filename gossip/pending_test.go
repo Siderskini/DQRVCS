@@ -1,0 +1,95 @@
+package gossip
+
+import "testing"
+
+func TestPendingPushLifecycle(t *testing.T) {
+	root := t.TempDir()
+	s, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	push, err := s.UpsertPendingPush(PendingPush{
+		ProposalID: "proposal-1",
+		Remote:     "origin",
+		SourceRef:  "main",
+		TargetRef:  "refs/heads/main",
+		NewOID:     "abc123",
+		GitArgs:    []string{"origin", "main"},
+		Status:     PendingPushStatusPending,
+	})
+	if err != nil {
+		t.Fatalf("upsert pending: %v", err)
+	}
+	if push.Status != PendingPushStatusPending {
+		t.Fatalf("unexpected status: %s", push.Status)
+	}
+
+	pushes, err := s.ListPendingPushes()
+	if err != nil {
+		t.Fatalf("list pushes: %v", err)
+	}
+	if len(pushes) != 1 {
+		t.Fatalf("expected 1 push, got %d", len(pushes))
+	}
+
+	if err := s.MarkPendingPushPending("proposal-1", "awaiting quorum"); err != nil {
+		t.Fatalf("mark pending: %v", err)
+	}
+	if err := s.MarkPendingPushFailed("proposal-1", "network issue"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	if err := s.MarkPendingPushCompleted("proposal-1"); err != nil {
+		t.Fatalf("mark completed: %v", err)
+	}
+
+	pushes, err = s.ListPendingPushes()
+	if err != nil {
+		t.Fatalf("list pushes after status updates: %v", err)
+	}
+	if len(pushes) != 1 {
+		t.Fatalf("expected 1 push after updates, got %d", len(pushes))
+	}
+	if pushes[0].Status != PendingPushStatusCompleted {
+		t.Fatalf("expected completed status, got %s", pushes[0].Status)
+	}
+	if pushes[0].Attempts < 3 {
+		t.Fatalf("expected attempts to increment, got %d", pushes[0].Attempts)
+	}
+}
+
+func TestPendingPushPersistsAcrossReopen(t *testing.T) {
+	root := t.TempDir()
+	s1, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("open store1: %v", err)
+	}
+
+	_, err = s1.UpsertPendingPush(PendingPush{
+		ProposalID: "proposal-2",
+		Remote:     "origin",
+		SourceRef:  "feature",
+		TargetRef:  "refs/heads/feature",
+		NewOID:     "def456",
+		GitArgs:    []string{"origin", "feature"},
+		Status:     PendingPushStatusPending,
+	})
+	if err != nil {
+		t.Fatalf("upsert pending: %v", err)
+	}
+
+	s2, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("open store2: %v", err)
+	}
+	pushes, err := s2.ListPendingPushes()
+	if err != nil {
+		t.Fatalf("list pushes after reopen: %v", err)
+	}
+	if len(pushes) != 1 {
+		t.Fatalf("expected 1 push after reopen, got %d", len(pushes))
+	}
+	if pushes[0].ProposalID != "proposal-2" {
+		t.Fatalf("unexpected proposal id after reopen: %s", pushes[0].ProposalID)
+	}
+}

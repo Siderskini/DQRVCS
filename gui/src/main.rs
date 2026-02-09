@@ -1,0 +1,3476 @@
+use chrono::{DateTime, Utc};
+use eframe::egui::{self, Color32, ComboBox, RichText, TextEdit, Ui};
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+fn main() -> eframe::Result<()> {
+    let mut options = eframe::NativeOptions::default();
+    options.viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([1000.0, 700.0]);
+
+    eframe::run_native(
+        "VCS Desktop",
+        options,
+        Box::new(|cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            Ok(Box::new(VcsGuiApp::new()))
+        }),
+    )
+}
+
+struct VcsGuiApp {
+    repo_path: String,
+    vcs_binary: String,
+    auto_refresh: bool,
+    refresh_every_sec: f32,
+    middle_tab: MiddleTab,
+    last_refresh: Instant,
+    data: AppData,
+    load_error: Option<String>,
+    action_output: String,
+    cli_input: String,
+    diff_output: String,
+    propose_form: ProposeForm,
+    vote_form: VoteForm,
+    peer_form: PeerForm,
+    git_form: GitForm,
+    merge_form: MergeForm,
+    history_form: HistoryForm,
+    consensus_form: ConsensusForm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum MiddleTab {
+    #[default]
+    Staging,
+    Advanced,
+    Collaboration,
+}
+
+#[derive(Default)]
+struct ProposeForm {
+    reference: String,
+    new_oid: String,
+    old_oid: String,
+    epoch: String,
+    ttl_hours: String,
+}
+
+#[derive(Default)]
+struct VoteForm {
+    proposal_id: String,
+    vote_yes: bool,
+}
+
+#[derive(Default)]
+struct PeerForm {
+    peer_url: String,
+}
+
+#[derive(Default)]
+struct GitForm {
+    commit_message: String,
+    checkout_target: String,
+    revert_target: String,
+    squash_last: String,
+    squash_from: String,
+    squash_message: String,
+    squash_allow_dirty: bool,
+    selected_diff_file: String,
+    show_staged_diff: bool,
+}
+
+#[derive(Default)]
+struct MergeForm {
+    merge_target: String,
+    selected_conflict_file: String,
+    merge_commit_message: String,
+    editor: ConflictEditorState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ResetMode {
+    Soft,
+    #[default]
+    Mixed,
+    Hard,
+}
+
+impl ResetMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            ResetMode::Soft => "--soft",
+            ResetMode::Mixed => "--mixed",
+            ResetMode::Hard => "--hard",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ResetMode::Soft => "soft",
+            ResetMode::Mixed => "mixed",
+            ResetMode::Hard => "hard",
+        }
+    }
+}
+
+#[derive(Default)]
+struct HistoryForm {
+    selected_commit: String,
+    rebase_onto: String,
+    rebase_autosquash: bool,
+    rebase_autostash: bool,
+    rebase_merges: bool,
+    rebase_todo_text: String,
+    rebase_todo_info: String,
+    cherry_pick_refs: String,
+    cherry_pick_no_commit: bool,
+    reset_target: String,
+    reset_mode: ResetMode,
+    confirm_hard_reset: bool,
+}
+
+#[derive(Default)]
+struct ConsensusForm {
+    threshold: String,
+    members_csv: String,
+}
+
+#[derive(Default)]
+struct AppData {
+    repo: RepoData,
+    gossip: GossipData,
+    proposals: Vec<ProposalView>,
+}
+
+#[derive(Default)]
+struct RepoData {
+    branch: String,
+    head: String,
+    status_lines: Vec<String>,
+    status_entries: Vec<StatusEntry>,
+    branch_graph: String,
+    merge_in_progress: bool,
+    rebase_in_progress: bool,
+    cherry_pick_in_progress: bool,
+    conflict_files: Vec<String>,
+    recent_commits: Vec<CommitSummary>,
+    reflog_entries: Vec<ReflogEntry>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StatusEntry {
+    code: String,
+    path: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CommitSummary {
+    hash: String,
+    short_hash: String,
+    author: String,
+    date: String,
+    subject: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReflogEntry {
+    short_hash: String,
+    selector: String,
+    subject: String,
+    date: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ConflictLineSource {
+    #[default]
+    Ours,
+    Theirs,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConflictHunk {
+    ours_lines: Vec<String>,
+    theirs_lines: Vec<String>,
+    choices: Vec<ConflictLineSource>,
+}
+
+#[derive(Debug, Clone)]
+enum ConflictSection {
+    Plain(String),
+    Hunk(ConflictHunk),
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConflictEditorState {
+    file_path: String,
+    sections: Vec<ConflictSection>,
+    parse_error: String,
+}
+
+#[derive(Default)]
+struct GossipData {
+    node_id: String,
+    peers: Vec<String>,
+    ops: Vec<Operation>,
+    pending_pushes: Vec<PendingPush>,
+    consensus_threshold: f64,
+    consensus_members: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IdentityFile {
+    #[serde(default)]
+    node_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PeersFile {
+    #[serde(default)]
+    peers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConsensusConfigFile {
+    #[serde(default)]
+    threshold: f64,
+    #[serde(default)]
+    members: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PendingPushFile {
+    #[serde(default)]
+    pushes: Vec<PendingPush>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PendingPush {
+    #[serde(default)]
+    proposal_id: String,
+    #[serde(default)]
+    remote: String,
+    #[serde(default)]
+    target_ref: String,
+    #[serde(default)]
+    new_oid: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    attempts: i64,
+    #[serde(default)]
+    last_error: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Operation {
+    #[serde(default)]
+    id: String,
+    #[serde(rename = "type", default)]
+    op_type: String,
+    #[serde(default)]
+    author: String,
+    #[serde(default)]
+    seq: u64,
+    #[serde(default)]
+    timestamp: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProposalPayload {
+    #[serde(default)]
+    proposal_id: String,
+    #[serde(default, rename = "ref")]
+    reference: String,
+    #[serde(default)]
+    old_oid: String,
+    #[serde(default)]
+    new_oid: String,
+    #[serde(default)]
+    epoch: u64,
+    #[serde(default)]
+    expires_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct VotePayload {
+    #[serde(default)]
+    proposal_id: String,
+    #[serde(default)]
+    decision: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CertPayload {
+    #[serde(default)]
+    proposal_id: String,
+    #[serde(default)]
+    certified: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProposalView {
+    proposal_id: String,
+    reference: String,
+    old_oid: String,
+    new_oid: String,
+    epoch: u64,
+    proposer: String,
+    created_at: String,
+    expires_at: String,
+    yes_votes: usize,
+    no_votes: usize,
+    voters: usize,
+    required_yes: usize,
+    quorum: bool,
+    certified: bool,
+    expired: bool,
+}
+
+impl VcsGuiApp {
+    fn new() -> Self {
+        let repo_guess = guess_repo_root()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let repo_text = repo_guess.to_string_lossy().to_string();
+
+        let mut app = Self {
+            repo_path: repo_text.clone(),
+            vcs_binary: default_vcs_binary(repo_guess).to_string_lossy().to_string(),
+            auto_refresh: true,
+            refresh_every_sec: 3.0,
+            middle_tab: MiddleTab::Staging,
+            last_refresh: Instant::now() - Duration::from_secs(100),
+            data: AppData::default(),
+            load_error: None,
+            action_output: String::new(),
+            cli_input: String::new(),
+            diff_output: String::new(),
+            propose_form: ProposeForm {
+                reference: String::new(),
+                new_oid: String::new(),
+                old_oid: String::new(),
+                epoch: "0".to_string(),
+                ttl_hours: "24".to_string(),
+            },
+            vote_form: VoteForm {
+                proposal_id: String::new(),
+                vote_yes: true,
+            },
+            peer_form: PeerForm::default(),
+            git_form: GitForm {
+                squash_last: "2".to_string(),
+                ..GitForm::default()
+            },
+            merge_form: MergeForm::default(),
+            history_form: HistoryForm::default(),
+            consensus_form: ConsensusForm::default(),
+        };
+        app.refresh();
+        app
+    }
+
+    fn refresh(&mut self) {
+        self.last_refresh = Instant::now();
+
+        let repo = PathBuf::from(self.repo_path.trim());
+        if repo.as_os_str().is_empty() {
+            self.load_error = Some("Repository path is empty".to_string());
+            return;
+        }
+
+        match load_repo_data(&repo) {
+            Ok(repo_data) => self.data.repo = repo_data,
+            Err(err) => {
+                self.load_error = Some(err);
+                return;
+            }
+        }
+
+        match load_gossip_data(&repo) {
+            Ok(gossip_data) => {
+                self.data.proposals = compute_proposal_views(&gossip_data);
+                self.data.gossip = gossip_data;
+                self.load_error = None;
+            }
+            Err(err) => self.load_error = Some(err),
+        }
+
+        if self.propose_form.reference.trim().is_empty() {
+            let branch = self.data.repo.branch.trim();
+            if !branch.is_empty() && branch != "HEAD" {
+                self.propose_form.reference = format!("refs/heads/{branch}");
+            }
+        }
+        if self.propose_form.new_oid.trim().is_empty() {
+            self.propose_form.new_oid = self.data.repo.head.clone();
+        }
+
+        let selected_exists = self
+            .data
+            .repo
+            .status_entries
+            .iter()
+            .any(|entry| entry.path == self.git_form.selected_diff_file);
+        if !selected_exists {
+            self.git_form.selected_diff_file = self
+                .data
+                .repo
+                .status_entries
+                .first()
+                .map(|entry| entry.path.clone())
+                .unwrap_or_default();
+        }
+        self.diff_output = load_diff_output(
+            &repo,
+            self.git_form.selected_diff_file.trim(),
+            self.git_form.show_staged_diff,
+        )
+        .unwrap_or_else(|err| format!("(unable to load diff: {err})"));
+
+        let selected_conflict_exists = self
+            .data
+            .repo
+            .conflict_files
+            .iter()
+            .any(|path| path == &self.merge_form.selected_conflict_file);
+        if !selected_conflict_exists {
+            self.merge_form.selected_conflict_file = self
+                .data
+                .repo
+                .conflict_files
+                .first()
+                .cloned()
+                .unwrap_or_default();
+        }
+        if self.merge_form.selected_conflict_file.is_empty() {
+            self.merge_form.editor = ConflictEditorState::default();
+        } else if !self.merge_form.editor.file_path.is_empty()
+            && self.merge_form.editor.file_path != self.merge_form.selected_conflict_file
+        {
+            self.merge_form.editor = ConflictEditorState::default();
+        }
+
+        let selected_commit_exists = self
+            .data
+            .repo
+            .recent_commits
+            .iter()
+            .any(|commit| commit.hash == self.history_form.selected_commit);
+        if !selected_commit_exists {
+            self.history_form.selected_commit = self
+                .data
+                .repo
+                .recent_commits
+                .first()
+                .map(|commit| commit.hash.clone())
+                .unwrap_or_default();
+        }
+        if self.history_form.rebase_onto.trim().is_empty() {
+            self.history_form.rebase_onto = self.data.repo.branch.clone();
+        }
+        if self.history_form.rebase_todo_info.trim().is_empty() && self.data.repo.rebase_in_progress
+        {
+            self.history_form.rebase_todo_info =
+                "Rebase in progress: load todo to edit steps".to_string();
+        }
+
+        if self.consensus_form.threshold.trim().is_empty() {
+            self.consensus_form.threshold = format!("{:.2}", self.data.gossip.consensus_threshold);
+        }
+        if self.consensus_form.members_csv.trim().is_empty() {
+            self.consensus_form.members_csv = self.data.gossip.consensus_members.join(",");
+        }
+    }
+
+    fn run_command_with_env(
+        &mut self,
+        program: &str,
+        args: &[String],
+        envs: &[(String, String)],
+        context: &str,
+    ) {
+        let cwd = self.repo_path.trim();
+        if program.trim().is_empty() || cwd.is_empty() {
+            self.action_output = "Both repository path and vcs binary must be set.".to_string();
+            return;
+        }
+
+        let mut cmd = Command::new(program);
+        cmd.current_dir(cwd);
+        cmd.args(args);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        match cmd.output() {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                self.action_output = if output.status.success() {
+                    if stdout.is_empty() {
+                        format!("{context} completed")
+                    } else {
+                        stdout
+                    }
+                } else if stderr.is_empty() {
+                    format!("{context} failed: {}", output.status)
+                } else {
+                    format!("{context} failed: {stderr}")
+                };
+            }
+            Err(err) => {
+                self.action_output = format!("failed to execute {context}: {err}");
+            }
+        }
+        self.refresh();
+    }
+
+    fn run_command(&mut self, program: &str, args: &[String], context: &str) {
+        self.run_command_with_env(program, args, &[], context);
+    }
+
+    fn run_vcs_command(&mut self, args: &[String]) {
+        let repo = PathBuf::from(self.repo_path.trim());
+        let bin = resolve_vcs_binary(self.vcs_binary.trim(), &repo);
+        self.run_command(&bin, args, "vcs command");
+    }
+
+    fn run_vcs_command_static(&mut self, args: &[&str]) {
+        let args = args
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        self.run_vcs_command(&args);
+    }
+
+    fn run_git_command(&mut self, args: &[String]) {
+        self.run_command("git", args, "git command");
+    }
+
+    fn run_git_command_static(&mut self, args: &[&str]) {
+        let args = args
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        self.run_git_command(&args);
+    }
+
+    fn run_git_command_with_env(
+        &mut self,
+        args: &[String],
+        envs: &[(String, String)],
+        context: &str,
+    ) {
+        self.run_command_with_env("git", args, envs, context);
+    }
+
+    fn refresh_diff_output(&mut self) {
+        let repo = PathBuf::from(self.repo_path.trim());
+        self.diff_output = load_diff_output(
+            &repo,
+            self.git_form.selected_diff_file.trim(),
+            self.git_form.show_staged_diff,
+        )
+        .unwrap_or_else(|err| format!("(unable to load diff: {err})"));
+    }
+
+    fn load_selected_conflict_editor(&mut self) {
+        let selected = self.merge_form.selected_conflict_file.trim();
+        if selected.is_empty() {
+            self.action_output = "Select a conflict file first".to_string();
+            return;
+        }
+
+        let repo = PathBuf::from(self.repo_path.trim());
+        match load_conflict_editor_state(&repo, selected) {
+            Ok(editor) => {
+                self.merge_form.editor = editor;
+                self.action_output = format!("Loaded conflict editor for {selected}");
+            }
+            Err(err) => {
+                self.merge_form.editor = ConflictEditorState {
+                    file_path: selected.to_string(),
+                    sections: Vec::new(),
+                    parse_error: err.clone(),
+                };
+                self.action_output = err;
+            }
+        }
+    }
+
+    fn save_conflict_editor_to_file(&mut self) {
+        let file_path = self.merge_form.editor.file_path.trim();
+        if file_path.is_empty() {
+            self.action_output = "Load a conflict file into the editor first".to_string();
+            return;
+        }
+        if !self.merge_form.editor.parse_error.trim().is_empty() {
+            self.action_output = format!(
+                "Cannot save while conflict parser has errors: {}",
+                self.merge_form.editor.parse_error
+            );
+            return;
+        }
+
+        let repo = PathBuf::from(self.repo_path.trim());
+        match resolve_repo_relative_path(&repo, file_path).and_then(|absolute_path| {
+            let content = compose_conflict_editor_output(&self.merge_form.editor.sections);
+            fs::write(&absolute_path, content)
+                .map_err(|err| format!("failed to write {}: {err}", absolute_path.display()))
+        }) {
+            Ok(_) => {
+                self.action_output = format!("Wrote resolved content to {file_path}");
+                self.git_form.selected_diff_file = file_path.to_string();
+                self.git_form.show_staged_diff = false;
+                self.refresh();
+            }
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn generate_rebase_todo_text(&mut self) {
+        let onto = self.history_form.rebase_onto.trim();
+        if onto.is_empty() {
+            self.action_output = "Rebase target cannot be empty".to_string();
+            return;
+        }
+        let repo = PathBuf::from(self.repo_path.trim());
+        match build_rebase_todo_text(&repo, onto) {
+            Ok(todo) => {
+                self.history_form.rebase_todo_text = todo;
+                self.history_form.rebase_todo_info =
+                    format!("Generated todo list for range {onto}..HEAD");
+                self.action_output = "Rebase todo generated".to_string();
+            }
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn load_current_rebase_todo(&mut self) {
+        let repo = PathBuf::from(self.repo_path.trim());
+        match read_current_rebase_todo(&repo) {
+            Ok((path, todo)) => {
+                self.history_form.rebase_todo_text = todo;
+                self.history_form.rebase_todo_info = format!("Loaded {}", path.display());
+                self.action_output = "Loaded active rebase todo".to_string();
+            }
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn save_current_rebase_todo(&mut self) {
+        let repo = PathBuf::from(self.repo_path.trim());
+        let todo = self.history_form.rebase_todo_text.clone();
+        match validate_rebase_todo_text(&todo).and_then(|_| write_current_rebase_todo(&repo, &todo))
+        {
+            Ok(path) => {
+                self.history_form.rebase_todo_info = format!("Saved {}", path.display());
+                self.action_output = "Saved active rebase todo".to_string();
+            }
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn start_interactive_rebase_from_todo(&mut self) {
+        let todo = self.history_form.rebase_todo_text.clone();
+        let onto = self.history_form.rebase_onto.trim();
+        if onto.is_empty() {
+            self.action_output = "Rebase target cannot be empty".to_string();
+            return;
+        }
+        if let Err(err) = validate_rebase_todo_text(&todo) {
+            self.action_output = err;
+            return;
+        }
+
+        let repo = PathBuf::from(self.repo_path.trim());
+        let todo_temp = match write_temp_rebase_todo(&todo) {
+            Ok(path) => path,
+            Err(err) => {
+                self.action_output = err;
+                return;
+            }
+        };
+        let editor_script = match write_sequence_editor_script(&repo) {
+            Ok(path) => path,
+            Err(err) => {
+                self.action_output = err;
+                return;
+            }
+        };
+
+        match build_interactive_rebase_args(
+            onto,
+            self.history_form.rebase_autosquash,
+            self.history_form.rebase_autostash,
+            self.history_form.rebase_merges,
+        ) {
+            Ok(args) => {
+                let envs = vec![
+                    (
+                        "GIT_SEQUENCE_EDITOR".to_string(),
+                        editor_script.to_string_lossy().to_string(),
+                    ),
+                    (
+                        "VCS_GUI_REBASE_TODO".to_string(),
+                        todo_temp.to_string_lossy().to_string(),
+                    ),
+                ];
+                self.run_git_command_with_env(&args, &envs, "interactive rebase");
+            }
+            Err(err) => self.action_output = err,
+        }
+    }
+
+    fn run_cli_input_command(&mut self) {
+        let raw = self.cli_input.trim();
+        if raw.is_empty() {
+            self.action_output = "Enter a VCS command".to_string();
+            return;
+        }
+        let mut tokens = match parse_cli_tokens(raw) {
+            Ok(tokens) => tokens,
+            Err(err) => {
+                self.action_output = err;
+                return;
+            }
+        };
+        if tokens.is_empty() {
+            self.action_output = "Enter a VCS command".to_string();
+            return;
+        }
+        if tokens.first().map(|token| token == "vcs").unwrap_or(false) {
+            tokens.remove(0);
+        }
+        let command = tokens.first().cloned().unwrap_or_default();
+        if command.is_empty() {
+            self.action_output = "Enter a VCS command".to_string();
+            return;
+        }
+        if !is_allowed_vcs_command(&command) {
+            self.action_output = format!(
+                "Command {command:?} is not allowed in GUI CLI input. Allowed: {}",
+                allowed_vcs_commands().join(", ")
+            );
+            return;
+        }
+
+        self.run_vcs_command(&tokens);
+    }
+
+    fn draw_top_controls(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Repository");
+            ui.add(TextEdit::singleline(&mut self.repo_path).desired_width(420.0));
+            ui.label("vcs binary");
+            ui.add(TextEdit::singleline(&mut self.vcs_binary).desired_width(240.0));
+
+            if ui.button("Refresh").clicked() {
+                self.refresh();
+            }
+            ui.checkbox(&mut self.auto_refresh, "Auto refresh");
+            ui.add(
+                egui::DragValue::new(&mut self.refresh_every_sec)
+                    .range(1.0..=60.0)
+                    .speed(0.2)
+                    .prefix("every ")
+                    .suffix("s"),
+            );
+        });
+
+        if let Some(err) = &self.load_error {
+            ui.colored_label(Color32::from_rgb(255, 120, 120), err);
+        }
+    }
+
+    fn draw_repo_panel(&self, ui: &mut Ui) {
+        ui.group(|ui| {
+            ui.heading("Repository");
+            ui.label(format!("Branch: {}", non_empty(&self.data.repo.branch)));
+            let head_text = if self.data.repo.head.trim().is_empty() {
+                "(no commits yet)".to_string()
+            } else {
+                short_hash(&self.data.repo.head)
+            };
+            ui.label(format!("HEAD: {}", head_text));
+            ui.label(format!(
+                "Working tree changes: {}",
+                self.data.repo.status_lines.len()
+            ));
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(160.0)
+                .show(ui, |ui| {
+                    if self.data.repo.status_lines.is_empty() {
+                        ui.label("clean");
+                    } else {
+                        for line in &self.data.repo.status_lines {
+                            ui.monospace(line);
+                        }
+                    }
+                });
+        });
+    }
+
+    fn draw_git_panel(&mut self, ui: &mut Ui) {
+        ui.group(|ui| {
+            ui.heading("Git Operations");
+
+            let status_entries = self.data.repo.status_entries.clone();
+            let selected_diff = self.git_form.selected_diff_file.clone();
+
+            ui.horizontal(|ui| {
+                if ui.button("Stage all").clicked() {
+                    self.run_vcs_command_static(&["stage"]);
+                }
+                if ui.button("Unstage all").clicked() {
+                    self.run_vcs_command_static(&["unstage"]);
+                }
+            });
+
+            if status_entries.is_empty() {
+                ui.label("Working tree is clean");
+            } else {
+                ComboBox::from_label("File")
+                    .selected_text(non_empty(&selected_diff))
+                    .show_ui(ui, |ui| {
+                        for entry in &status_entries {
+                            let label = format!("{} {}", non_empty(&entry.code), entry.path);
+                            if ui
+                                .selectable_value(
+                                    &mut self.git_form.selected_diff_file,
+                                    entry.path.clone(),
+                                    label,
+                                )
+                                .changed()
+                            {
+                                self.refresh_diff_output();
+                            }
+                        }
+                    });
+
+                ui.horizontal(|ui| {
+                    if ui.button("Stage file").clicked() {
+                        match build_path_action_args(
+                            "stage",
+                            self.git_form.selected_diff_file.trim(),
+                            "Select a file to stage",
+                        ) {
+                            Ok(args) => self.run_vcs_command(&args),
+                            Err(err) => self.action_output = err,
+                        }
+                    }
+                    if ui.button("Unstage file").clicked() {
+                        match build_path_action_args(
+                            "unstage",
+                            self.git_form.selected_diff_file.trim(),
+                            "Select a file to unstage",
+                        ) {
+                            Ok(args) => self.run_vcs_command(&args),
+                            Err(err) => self.action_output = err,
+                        }
+                    }
+                });
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Commit message");
+                ui.add(
+                    TextEdit::singleline(&mut self.git_form.commit_message).desired_width(360.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Commit").clicked() {
+                    match build_commit_args(self.git_form.commit_message.trim(), false) {
+                        Ok(args) => self.run_vcs_command(&args),
+                        Err(err) => self.action_output = err,
+                    }
+                }
+                if ui.button("Commit all").clicked() {
+                    match build_commit_args(self.git_form.commit_message.trim(), true) {
+                        Ok(args) => self.run_vcs_command(&args),
+                        Err(err) => self.action_output = err,
+                    }
+                }
+                if ui.button("Amend").clicked() {
+                    let args = build_amend_args(self.git_form.commit_message.trim());
+                    self.run_vcs_command(&args);
+                }
+            });
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Checkout target");
+                ui.add(
+                    TextEdit::singleline(&mut self.git_form.checkout_target).desired_width(240.0),
+                );
+                if ui.button("Checkout").clicked() {
+                    match build_checkout_args(self.git_form.checkout_target.trim()) {
+                        Ok(args) => self.run_vcs_command(&args),
+                        Err(err) => self.action_output = err,
+                    }
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Revert commit");
+                ui.add(TextEdit::singleline(&mut self.git_form.revert_target).desired_width(240.0));
+                if ui.button("Revert").clicked() {
+                    match build_revert_args(self.git_form.revert_target.trim(), false) {
+                        Ok(args) => self.run_vcs_command(&args),
+                        Err(err) => self.action_output = err,
+                    }
+                }
+                if ui.button("Revert (--no-commit)").clicked() {
+                    match build_revert_args(self.git_form.revert_target.trim(), true) {
+                        Ok(args) => self.run_vcs_command(&args),
+                        Err(err) => self.action_output = err,
+                    }
+                }
+            });
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Pull").clicked() {
+                    self.run_vcs_command_static(&["pull"]);
+                }
+                if ui.button("Push").clicked() {
+                    self.run_vcs_command_static(&["push"]);
+                }
+                if ui.button("Push immediate").clicked() {
+                    self.run_vcs_command_static(&["push", "--no-auto-proposal"]);
+                }
+            });
+
+            ui.separator();
+            ui.label(RichText::new("Squash").strong());
+            ui.horizontal(|ui| {
+                ui.label("Last");
+                ui.add(TextEdit::singleline(&mut self.git_form.squash_last).desired_width(50.0));
+                ui.label("From");
+                ui.add(TextEdit::singleline(&mut self.git_form.squash_from).desired_width(120.0));
+                ui.checkbox(&mut self.git_form.squash_allow_dirty, "Allow dirty");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Message");
+                ui.add(
+                    TextEdit::singleline(&mut self.git_form.squash_message).desired_width(280.0),
+                );
+                if ui.button("Squash").clicked() {
+                    match build_squash_args(
+                        self.git_form.squash_last.trim(),
+                        self.git_form.squash_from.trim(),
+                        self.git_form.squash_message.trim(),
+                        self.git_form.squash_allow_dirty,
+                    ) {
+                        Ok(args) => self.run_vcs_command(&args),
+                        Err(err) => self.action_output = err,
+                    }
+                }
+            });
+        });
+    }
+
+    fn draw_merge_panel(&mut self, ui: &mut Ui) {
+        ui.group(|ui| {
+            ui.heading("Merge + Conflict Resolution");
+            ui.horizontal(|ui| {
+                ui.label("Merge target");
+                ui.add(
+                    TextEdit::singleline(&mut self.merge_form.merge_target).desired_width(220.0),
+                );
+                if ui.button("Start merge").clicked() {
+                    match build_merge_start_args(self.merge_form.merge_target.trim()) {
+                        Ok(args) => self.run_git_command(&args),
+                        Err(err) => self.action_output = err,
+                    }
+                }
+            });
+
+            if self.data.repo.merge_in_progress {
+                ui.colored_label(
+                    Color32::from_rgb(250, 200, 100),
+                    "Merge is in progress. Resolve conflicts then continue or abort.",
+                );
+            } else {
+                ui.label("No merge in progress");
+            }
+            if self.data.repo.rebase_in_progress {
+                ui.colored_label(Color32::from_rgb(250, 200, 100), "Rebase in progress");
+            }
+            if self.data.repo.cherry_pick_in_progress {
+                ui.colored_label(Color32::from_rgb(250, 200, 100), "Cherry-pick in progress");
+            }
+
+            ui.horizontal(|ui| {
+                let can_continue =
+                    self.data.repo.merge_in_progress || self.data.repo.rebase_in_progress;
+                if ui
+                    .add_enabled(can_continue, egui::Button::new("Continue"))
+                    .clicked()
+                {
+                    if self.data.repo.merge_in_progress {
+                        self.run_git_command_static(&["merge", "--continue"]);
+                    } else {
+                        self.run_git_command_static(&["rebase", "--continue"]);
+                    }
+                }
+                if ui
+                    .add_enabled(
+                        self.data.repo.merge_in_progress,
+                        egui::Button::new("Abort merge"),
+                    )
+                    .clicked()
+                {
+                    self.run_git_command_static(&["merge", "--abort"]);
+                }
+                if ui
+                    .add_enabled(
+                        self.data.repo.rebase_in_progress,
+                        egui::Button::new("Abort rebase"),
+                    )
+                    .clicked()
+                {
+                    self.run_git_command_static(&["rebase", "--abort"]);
+                }
+                if ui
+                    .add_enabled(
+                        self.data.repo.cherry_pick_in_progress,
+                        egui::Button::new("Abort cherry-pick"),
+                    )
+                    .clicked()
+                {
+                    self.run_git_command_static(&["cherry-pick", "--abort"]);
+                }
+            });
+
+            ui.separator();
+            ui.label(format!(
+                "Conflicts: {}",
+                self.data.repo.conflict_files.len()
+            ));
+            if self.data.repo.conflict_files.is_empty() {
+                ui.label("No conflicted files detected");
+            } else {
+                let mut selected_changed = false;
+                ComboBox::from_label("Conflict file")
+                    .selected_text(non_empty(&self.merge_form.selected_conflict_file))
+                    .show_ui(ui, |ui| {
+                        for path in &self.data.repo.conflict_files {
+                            if ui
+                                .selectable_value(
+                                    &mut self.merge_form.selected_conflict_file,
+                                    path.clone(),
+                                    path,
+                                )
+                                .changed()
+                            {
+                                selected_changed = true;
+                            }
+                        }
+                    });
+                if selected_changed {
+                    self.load_selected_conflict_editor();
+                }
+
+                ui.horizontal(|ui| {
+                    if ui.button("Load line editor").clicked() {
+                        self.load_selected_conflict_editor();
+                    }
+                    if ui.button("Save resolved file").clicked() {
+                        self.save_conflict_editor_to_file();
+                    }
+                    if ui.button("Use ours for all hunks").clicked() {
+                        apply_conflict_choice_to_all_hunks(
+                            &mut self.merge_form.editor.sections,
+                            ConflictLineSource::Ours,
+                        );
+                    }
+                    if ui.button("Use theirs for all hunks").clicked() {
+                        apply_conflict_choice_to_all_hunks(
+                            &mut self.merge_form.editor.sections,
+                            ConflictLineSource::Theirs,
+                        );
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    if ui.button("Use ours").clicked() {
+                        match build_conflict_resolution_args(
+                            "--ours",
+                            self.merge_form.selected_conflict_file.trim(),
+                        ) {
+                            Ok(args) => self.run_git_command(&args),
+                            Err(err) => self.action_output = err,
+                        }
+                    }
+                    if ui.button("Use theirs").clicked() {
+                        match build_conflict_resolution_args(
+                            "--theirs",
+                            self.merge_form.selected_conflict_file.trim(),
+                        ) {
+                            Ok(args) => self.run_git_command(&args),
+                            Err(err) => self.action_output = err,
+                        }
+                    }
+                    if ui.button("Mark resolved (add)").clicked() {
+                        match build_git_add_path_args(self.merge_form.selected_conflict_file.trim())
+                        {
+                            Ok(args) => self.run_git_command(&args),
+                            Err(err) => self.action_output = err,
+                        }
+                    }
+                    if ui.button("Load in Diff panel").clicked() {
+                        let selected = self.merge_form.selected_conflict_file.trim();
+                        if selected.is_empty() {
+                            self.action_output = "Select a conflict file first".to_string();
+                        } else {
+                            self.git_form.selected_diff_file = selected.to_string();
+                            self.git_form.show_staged_diff = false;
+                            self.refresh_diff_output();
+                        }
+                    }
+                });
+
+                ui.separator();
+                ui.label(RichText::new("Line-by-line Conflict Editor").strong());
+                if !self.merge_form.editor.parse_error.trim().is_empty() {
+                    ui.colored_label(
+                        Color32::from_rgb(220, 100, 100),
+                        format!("Parser error: {}", self.merge_form.editor.parse_error),
+                    );
+                }
+                if self.merge_form.editor.sections.is_empty() {
+                    ui.label("Load a conflicted file to edit individual lines.");
+                } else {
+                    ui.label(format!(
+                        "Editing {}",
+                        non_empty(&self.merge_form.editor.file_path)
+                    ));
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for (section_idx, section) in
+                                self.merge_form.editor.sections.iter_mut().enumerate()
+                            {
+                                match section {
+                                    ConflictSection::Plain(text) => {
+                                        let lines = text.lines().count();
+                                        ui.label(format!(
+                                            "Context block {} ({} lines)",
+                                            section_idx + 1,
+                                            lines
+                                        ));
+                                    }
+                                    ConflictSection::Hunk(hunk) => {
+                                        ui.group(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "Conflict hunk {}",
+                                                    section_idx + 1
+                                                ))
+                                                .strong(),
+                                            );
+                                            let max_lines =
+                                                hunk.ours_lines.len().max(hunk.theirs_lines.len());
+                                            for line_idx in 0..max_lines {
+                                                if hunk.choices.len() <= line_idx {
+                                                    hunk.choices.push(
+                                                        if line_idx < hunk.ours_lines.len() {
+                                                            ConflictLineSource::Ours
+                                                        } else {
+                                                            ConflictLineSource::Theirs
+                                                        },
+                                                    );
+                                                }
+                                                let ours = hunk
+                                                    .ours_lines
+                                                    .get(line_idx)
+                                                    .map(|line| line.trim_end_matches('\n'))
+                                                    .unwrap_or("");
+                                                let theirs = hunk
+                                                    .theirs_lines
+                                                    .get(line_idx)
+                                                    .map(|line| line.trim_end_matches('\n'))
+                                                    .unwrap_or("");
+                                                ui.horizontal(|ui| {
+                                                    ui.monospace(format!("{:>3}", line_idx + 1));
+                                                    ui.radio_value(
+                                                        &mut hunk.choices[line_idx],
+                                                        ConflictLineSource::Ours,
+                                                        "ours",
+                                                    );
+                                                    ui.radio_value(
+                                                        &mut hunk.choices[line_idx],
+                                                        ConflictLineSource::Theirs,
+                                                        "theirs",
+                                                    );
+                                                    ui.colored_label(
+                                                        Color32::from_rgb(140, 180, 240),
+                                                        format!("ours: {ours}"),
+                                                    );
+                                                    ui.colored_label(
+                                                        Color32::from_rgb(240, 170, 130),
+                                                        format!("theirs: {theirs}"),
+                                                    );
+                                                });
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        });
+                }
+            }
+
+            ui.horizontal(|ui| {
+                ui.label("Merge commit message");
+                ui.add(
+                    TextEdit::singleline(&mut self.merge_form.merge_commit_message)
+                        .desired_width(300.0),
+                );
+                if ui.button("Commit merge").clicked() {
+                    match build_merge_commit_args(self.merge_form.merge_commit_message.trim()) {
+                        Ok(args) => self.run_git_command(&args),
+                        Err(err) => self.action_output = err,
+                    }
+                }
+            });
+        });
+    }
+
+    fn draw_history_panel(&mut self, ui: &mut Ui) {
+        ui.group(|ui| {
+            ui.heading("Advanced History");
+
+            let selected_commit_label = self
+                .data
+                .repo
+                .recent_commits
+                .iter()
+                .find(|commit| commit.hash == self.history_form.selected_commit)
+                .map(|commit| format!("{} {}", commit.short_hash, commit.subject))
+                .unwrap_or_else(|| non_empty(&self.history_form.selected_commit));
+
+            ComboBox::from_label("Recent commit")
+                .selected_text(selected_commit_label)
+                .show_ui(ui, |ui| {
+                    for commit in &self.data.repo.recent_commits {
+                        let label = format!(
+                            "{} {} ({}, {})",
+                            commit.short_hash, commit.subject, commit.author, commit.date
+                        );
+                        ui.selectable_value(
+                            &mut self.history_form.selected_commit,
+                            commit.hash.clone(),
+                            label,
+                        );
+                    }
+                });
+
+            ui.horizontal(|ui| {
+                if ui.button("Use for reset").clicked() {
+                    self.history_form.reset_target = self.history_form.selected_commit.clone();
+                }
+                if ui.button("Add to cherry-pick").clicked() {
+                    let selected = self.history_form.selected_commit.trim();
+                    if !selected.is_empty() {
+                        if self.history_form.cherry_pick_refs.trim().is_empty() {
+                            self.history_form.cherry_pick_refs = selected.to_string();
+                        } else {
+                            self.history_form.cherry_pick_refs = format!(
+                                "{} {}",
+                                self.history_form.cherry_pick_refs.trim(),
+                                selected
+                            );
+                        }
+                    }
+                }
+                if ui.button("Use for squash --from").clicked() {
+                    self.git_form.squash_from = self.history_form.selected_commit.clone();
+                    self.git_form.squash_last.clear();
+                }
+            });
+
+            ui.separator();
+            ui.label(RichText::new("Rebase").strong());
+            ui.horizontal(|ui| {
+                ui.label("Onto");
+                ui.add(
+                    TextEdit::singleline(&mut self.history_form.rebase_onto).desired_width(180.0),
+                );
+                ui.checkbox(&mut self.history_form.rebase_autosquash, "autosquash");
+                ui.checkbox(&mut self.history_form.rebase_autostash, "autostash");
+                ui.checkbox(&mut self.history_form.rebase_merges, "rebase-merges");
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Run rebase").clicked() {
+                    match build_rebase_args(
+                        self.history_form.rebase_onto.trim(),
+                        self.history_form.rebase_autosquash,
+                        self.history_form.rebase_autostash,
+                        self.history_form.rebase_merges,
+                    ) {
+                        Ok(args) => self.run_git_command(&args),
+                        Err(err) => self.action_output = err,
+                    }
+                }
+                if ui.button("Continue rebase").clicked() {
+                    self.run_git_command_static(&["rebase", "--continue"]);
+                }
+                if ui.button("Abort rebase").clicked() {
+                    self.run_git_command_static(&["rebase", "--abort"]);
+                }
+            });
+
+            ui.separator();
+            ui.label(RichText::new("Interactive Rebase Todo").strong());
+            ui.horizontal(|ui| {
+                if ui.button("Generate todo").clicked() {
+                    self.generate_rebase_todo_text();
+                }
+                if ui.button("Load current todo").clicked() {
+                    self.load_current_rebase_todo();
+                }
+                if ui.button("Save current todo").clicked() {
+                    self.save_current_rebase_todo();
+                }
+                if ui.button("Start from edited todo").clicked() {
+                    self.start_interactive_rebase_from_todo();
+                }
+            });
+            if !self.history_form.rebase_todo_info.trim().is_empty() {
+                ui.label(self.history_form.rebase_todo_info.clone());
+            }
+            ui.add(
+                TextEdit::multiline(&mut self.history_form.rebase_todo_text)
+                    .desired_rows(12)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace),
+            );
+
+            ui.separator();
+            ui.label(RichText::new("Cherry-pick").strong());
+            ui.horizontal(|ui| {
+                ui.label("Refs");
+                ui.add(
+                    TextEdit::singleline(&mut self.history_form.cherry_pick_refs)
+                        .desired_width(260.0),
+                );
+                ui.checkbox(&mut self.history_form.cherry_pick_no_commit, "no-commit");
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Run cherry-pick").clicked() {
+                    match build_cherry_pick_args(
+                        self.history_form.cherry_pick_refs.trim(),
+                        self.history_form.cherry_pick_no_commit,
+                    ) {
+                        Ok(args) => self.run_git_command(&args),
+                        Err(err) => self.action_output = err,
+                    }
+                }
+                if ui.button("Abort cherry-pick").clicked() {
+                    self.run_git_command_static(&["cherry-pick", "--abort"]);
+                }
+            });
+
+            ui.separator();
+            ui.label(RichText::new("Reset HEAD").strong());
+            ui.horizontal(|ui| {
+                ui.label("Target");
+                ui.add(
+                    TextEdit::singleline(&mut self.history_form.reset_target).desired_width(200.0),
+                );
+                ComboBox::from_label("Mode")
+                    .selected_text(self.history_form.reset_mode.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.history_form.reset_mode,
+                            ResetMode::Soft,
+                            "soft",
+                        );
+                        ui.selectable_value(
+                            &mut self.history_form.reset_mode,
+                            ResetMode::Mixed,
+                            "mixed",
+                        );
+                        ui.selectable_value(
+                            &mut self.history_form.reset_mode,
+                            ResetMode::Hard,
+                            "hard",
+                        );
+                    });
+            });
+            if self.history_form.reset_mode == ResetMode::Hard {
+                ui.checkbox(
+                    &mut self.history_form.confirm_hard_reset,
+                    "I understand --hard discards uncommitted work",
+                );
+            }
+            if ui.button("Run reset").clicked() {
+                match build_reset_args(
+                    self.history_form.reset_target.trim(),
+                    self.history_form.reset_mode,
+                    self.history_form.confirm_hard_reset,
+                ) {
+                    Ok(args) => self.run_git_command(&args),
+                    Err(err) => self.action_output = err,
+                }
+            }
+
+            ui.separator();
+            ui.label(RichText::new("Reflog").strong());
+            egui::ScrollArea::vertical()
+                .max_height(150.0)
+                .show(ui, |ui| {
+                    if self.data.repo.reflog_entries.is_empty() {
+                        ui.label("No reflog entries found");
+                    } else {
+                        for entry in &self.data.repo.reflog_entries {
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.small_button("Use").clicked() {
+                                    self.history_form.reset_target = entry.selector.clone();
+                                }
+                                ui.monospace(format!(
+                                    "{} {} {} {}",
+                                    non_empty(&entry.short_hash),
+                                    non_empty(&entry.selector),
+                                    non_empty(&entry.subject),
+                                    non_empty(&entry.date)
+                                ));
+                            });
+                        }
+                    }
+                });
+        });
+    }
+
+    fn draw_diff_panel(&mut self, ui: &mut Ui) {
+        ui.group(|ui| {
+            ui.heading("Diff");
+            ui.horizontal(|ui| {
+                if ui
+                    .radio_value(&mut self.git_form.show_staged_diff, false, "Working tree")
+                    .changed()
+                {
+                    self.refresh_diff_output();
+                }
+                if ui
+                    .radio_value(&mut self.git_form.show_staged_diff, true, "Staged")
+                    .changed()
+                {
+                    self.refresh_diff_output();
+                }
+                if ui.button("Reload diff").clicked() {
+                    self.refresh_diff_output();
+                }
+            });
+            ui.label(format!(
+                "Scope: {}",
+                if self.git_form.selected_diff_file.trim().is_empty() {
+                    "all changed files".to_string()
+                } else {
+                    self.git_form.selected_diff_file.clone()
+                }
+            ));
+            ui.add(
+                TextEdit::multiline(&mut self.diff_output)
+                    .desired_rows(16)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace)
+                    .interactive(false),
+            );
+        });
+    }
+
+    fn draw_branch_graph_panel(&self, ui: &mut Ui) {
+        ui.group(|ui| {
+            ui.heading("Branch Graph");
+            let mut graph = self.data.repo.branch_graph.clone();
+            ui.add(
+                TextEdit::multiline(&mut graph)
+                    .desired_rows(18)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace)
+                    .interactive(false),
+            );
+        });
+    }
+
+    fn draw_consensus_config_panel(&mut self, ui: &mut Ui) {
+        ui.group(|ui| {
+            ui.heading("Consensus Config");
+            ui.horizontal(|ui| {
+                ui.label("Threshold");
+                ui.add(
+                    TextEdit::singleline(&mut self.consensus_form.threshold).desired_width(90.0),
+                );
+                ui.label("Members CSV");
+                ui.add(
+                    TextEdit::singleline(&mut self.consensus_form.members_csv).desired_width(320.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Apply config").clicked() {
+                    match build_consensus_config_args(
+                        self.consensus_form.threshold.trim(),
+                        self.consensus_form.members_csv.trim(),
+                        false,
+                    ) {
+                        Ok(args) => self.run_vcs_command(&args),
+                        Err(err) => self.action_output = err,
+                    }
+                }
+                if ui.button("Clear members").clicked() {
+                    match build_consensus_config_args(
+                        self.consensus_form.threshold.trim(),
+                        "",
+                        true,
+                    ) {
+                        Ok(args) => {
+                            self.run_vcs_command(&args);
+                            self.consensus_form.members_csv.clear();
+                        }
+                        Err(err) => self.action_output = err,
+                    }
+                }
+                if ui.button("Load current").clicked() {
+                    self.consensus_form.threshold =
+                        format!("{:.2}", self.data.gossip.consensus_threshold);
+                    self.consensus_form.members_csv = self.data.gossip.consensus_members.join(",");
+                }
+            });
+        });
+    }
+
+    fn draw_node_panel(&mut self, ui: &mut Ui) {
+        ui.group(|ui| {
+            ui.heading("Node + Peers");
+            ui.label(format!("Node ID: {}", non_empty(&self.data.gossip.node_id)));
+            ui.label(format!(
+                "Consensus threshold: {:.2}",
+                self.data.gossip.consensus_threshold
+            ));
+            ui.label(format!(
+                "Configured members: {}",
+                self.data.gossip.consensus_members.len()
+            ));
+            if !self.data.gossip.consensus_members.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    for member in &self.data.gossip.consensus_members {
+                        ui.monospace(short_hash(member));
+                    }
+                });
+            }
+            ui.separator();
+            ui.label(format!("Peers: {}", self.data.gossip.peers.len()));
+
+            ui.horizontal(|ui| {
+                ui.label("Peer URL");
+                ui.add(TextEdit::singleline(&mut self.peer_form.peer_url).desired_width(280.0));
+                if ui.button("Add peer").clicked() {
+                    let peer = self.peer_form.peer_url.trim().to_string();
+                    if !peer.is_empty() {
+                        self.run_vcs_command(&vec![
+                            "peer".to_string(),
+                            "add".to_string(),
+                            peer.clone(),
+                        ]);
+                        if !self.action_output.starts_with("command failed:") {
+                            self.peer_form.peer_url.clear();
+                        }
+                    } else {
+                        self.action_output = "peer URL cannot be empty".to_string();
+                    }
+                }
+            });
+
+            let peers = self.data.gossip.peers.clone();
+            let mut peer_to_remove: Option<String> = None;
+            egui::ScrollArea::vertical()
+                .max_height(120.0)
+                .show(ui, |ui| {
+                    if peers.is_empty() {
+                        ui.label("no peers configured");
+                    } else {
+                        for peer in &peers {
+                            ui.horizontal(|ui| {
+                                ui.monospace(peer);
+                                if ui.small_button("Remove").clicked() {
+                                    peer_to_remove = Some(peer.clone());
+                                }
+                            });
+                        }
+                    }
+                });
+            if let Some(peer) = peer_to_remove {
+                self.run_vcs_command(&vec!["peer".to_string(), "remove".to_string(), peer]);
+            }
+        });
+    }
+
+    fn draw_actions_panel(&mut self, ui: &mut Ui) {
+        ui.group(|ui| {
+            ui.heading("Actions");
+            ui.horizontal(|ui| {
+                if ui.button("Sync now").clicked() {
+                    self.run_vcs_command(&vec!["sync".to_string()]);
+                }
+                if ui.button("Process pending pushes").clicked() {
+                    self.run_vcs_command(&vec![
+                        "push".to_string(),
+                        "--process-pending".to_string(),
+                    ]);
+                }
+                if ui.button("List pending queue").clicked() {
+                    self.run_vcs_command(&vec!["push".to_string(), "--list-pending".to_string()]);
+                }
+            });
+
+            ui.separator();
+            ui.label(RichText::new("Create Proposal").strong());
+            ui.horizontal(|ui| {
+                ui.label("Ref");
+                ui.add(TextEdit::singleline(&mut self.propose_form.reference).desired_width(260.0));
+            });
+            ui.horizontal(|ui| {
+                ui.label("New OID");
+                ui.add(TextEdit::singleline(&mut self.propose_form.new_oid).desired_width(260.0));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Old OID");
+                ui.add(TextEdit::singleline(&mut self.propose_form.old_oid).desired_width(260.0));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Epoch");
+                ui.add(TextEdit::singleline(&mut self.propose_form.epoch).desired_width(100.0));
+                ui.label("TTL (hours)");
+                ui.add(TextEdit::singleline(&mut self.propose_form.ttl_hours).desired_width(100.0));
+            });
+            if ui.button("Propose").clicked() {
+                let mut args = vec![
+                    "consensus".to_string(),
+                    "propose".to_string(),
+                    "--ref".to_string(),
+                    self.propose_form.reference.trim().to_string(),
+                    "--new".to_string(),
+                    self.propose_form.new_oid.trim().to_string(),
+                ];
+                let old_oid = self.propose_form.old_oid.trim();
+                if !old_oid.is_empty() {
+                    args.push("--old".to_string());
+                    args.push(old_oid.to_string());
+                }
+                let epoch = self.propose_form.epoch.trim();
+                if !epoch.is_empty() {
+                    args.push("--epoch".to_string());
+                    args.push(epoch.to_string());
+                }
+                let ttl = self.propose_form.ttl_hours.trim();
+                if !ttl.is_empty() {
+                    args.push("--ttl".to_string());
+                    args.push(format!("{ttl}h"));
+                }
+                self.run_vcs_command(&args);
+            }
+
+            ui.separator();
+            ui.label(RichText::new("Vote / Certify").strong());
+            ui.horizontal(|ui| {
+                ui.label("Proposal ID");
+                ui.add(TextEdit::singleline(&mut self.vote_form.proposal_id).desired_width(260.0));
+            });
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.vote_form.vote_yes, true, "Yes");
+                ui.radio_value(&mut self.vote_form.vote_yes, false, "No");
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Cast vote").clicked() {
+                    let mut args = vec![
+                        "consensus".to_string(),
+                        "vote".to_string(),
+                        "--proposal".to_string(),
+                        self.vote_form.proposal_id.trim().to_string(),
+                    ];
+                    args.push(if self.vote_form.vote_yes {
+                        "--yes".to_string()
+                    } else {
+                        "--no".to_string()
+                    });
+                    self.run_vcs_command(&args);
+                }
+                if ui.button("Certify").clicked() {
+                    self.run_vcs_command(&vec![
+                        "consensus".to_string(),
+                        "certify".to_string(),
+                        "--proposal".to_string(),
+                        self.vote_form.proposal_id.trim().to_string(),
+                    ]);
+                }
+                if ui.button("Status").clicked() {
+                    self.run_vcs_command(&vec![
+                        "consensus".to_string(),
+                        "status".to_string(),
+                        "--proposal".to_string(),
+                        self.vote_form.proposal_id.trim().to_string(),
+                    ]);
+                }
+            });
+        });
+    }
+
+    fn draw_pending_panel(&self, ui: &mut Ui) {
+        ui.group(|ui| {
+            ui.heading("Pending Pushes");
+            if self.data.gossip.pending_pushes.is_empty() {
+                ui.label("No pending pushes");
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .max_height(190.0)
+                .show(ui, |ui| {
+                    for push in &self.data.gossip.pending_pushes {
+                        let color = match push.status.as_str() {
+                            "completed" => Color32::from_rgb(90, 190, 100),
+                            "failed" => Color32::from_rgb(220, 100, 100),
+                            _ => Color32::from_rgb(250, 200, 100),
+                        };
+                        ui.colored_label(
+                            color,
+                            format!(
+                                "{} {} -> {} ({}) attempts={}",
+                                short_hash(&push.proposal_id),
+                                non_empty(&push.remote),
+                                non_empty(&push.target_ref),
+                                non_empty(&push.status),
+                                push.attempts
+                            ),
+                        );
+                        ui.monospace(format!("new: {}", short_hash(&push.new_oid)));
+                        if !push.last_error.trim().is_empty() {
+                            ui.label(format!("last error: {}", push.last_error));
+                        }
+                        ui.separator();
+                    }
+                });
+        });
+    }
+
+    fn draw_proposals_panel(&mut self, ui: &mut Ui) {
+        ui.group(|ui| {
+            ui.heading("Proposals");
+            if self.data.proposals.is_empty() {
+                ui.label("No proposals found");
+                return;
+            }
+
+            let proposals = self.data.proposals.clone();
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    for proposal in proposals {
+                        let status_color = if proposal.certified {
+                            Color32::from_rgb(90, 190, 100)
+                        } else if proposal.quorum {
+                            Color32::from_rgb(150, 210, 120)
+                        } else if proposal.expired {
+                            Color32::from_rgb(220, 120, 120)
+                        } else {
+                            Color32::from_rgb(250, 200, 100)
+                        };
+
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .small_button("Use ID")
+                                .on_hover_text("Copy this proposal ID into the vote form")
+                                .clicked()
+                            {
+                                self.vote_form.proposal_id = proposal.proposal_id.clone();
+                            }
+
+                            ui.colored_label(
+                                status_color,
+                                format!(
+                                    "{} ref={} quorum={} certified={}",
+                                    short_hash(&proposal.proposal_id),
+                                    non_empty(&proposal.reference),
+                                    proposal.quorum,
+                                    proposal.certified
+                                ),
+                            );
+                        });
+                        ui.monospace(format!(
+                            "yes/no={}/{} voters={} required_yes={} epoch={}",
+                            proposal.yes_votes,
+                            proposal.no_votes,
+                            proposal.voters,
+                            proposal.required_yes,
+                            proposal.epoch
+                        ));
+                        ui.monospace(format!(
+                            "old={} new={}",
+                            short_hash(&proposal.old_oid),
+                            short_hash(&proposal.new_oid)
+                        ));
+                        ui.label(format!(
+                            "proposer={} created={} expires={}",
+                            short_hash(&proposal.proposer),
+                            non_empty(&proposal.created_at),
+                            non_empty(&proposal.expires_at)
+                        ));
+                        ui.separator();
+                    }
+                });
+        });
+    }
+
+    fn draw_ops_panel(&self, ui: &mut Ui) {
+        ui.group(|ui| {
+            ui.heading("Operation Feed");
+            if self.data.gossip.ops.is_empty() {
+                ui.label("No operations found");
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    for op in self.data.gossip.ops.iter().rev().take(120) {
+                        ui.monospace(format!(
+                            "{} #{} {} {} {}",
+                            non_empty(&op.timestamp),
+                            op.seq,
+                            non_empty(&op.op_type),
+                            short_hash(&op.author),
+                            short_hash(&op.id)
+                        ));
+                    }
+                });
+        });
+    }
+
+    fn draw_cli_input_panel(&mut self, ui: &mut Ui) {
+        ui.group(|ui| {
+            ui.heading("Run VCS CLI Command");
+            ui.label(format!(
+                "Allowed commands: {}",
+                allowed_vcs_commands().join(", ")
+            ));
+            ui.horizontal(|ui| {
+                let execute_width = 90.0;
+                let clear_width = 72.0;
+                let spacing = ui.spacing().item_spacing.x;
+                let input_width =
+                    (ui.available_width() - execute_width - clear_width - spacing * 2.0).max(120.0);
+
+                let input_response = ui.add_sized(
+                    [input_width, 0.0],
+                    TextEdit::singleline(&mut self.cli_input)
+                        .hint_text("Examples: status | commit -m \"message\" | consensus list"),
+                );
+                let run_on_enter = input_response.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+
+                let execute_clicked = ui
+                    .add_sized(
+                        [execute_width, 0.0],
+                        egui::Button::new("Execute")
+                            .stroke(egui::Stroke::new(1.0, Color32::from_gray(145))),
+                    )
+                    .clicked();
+
+                if execute_clicked || run_on_enter {
+                    self.run_cli_input_command();
+                }
+                if ui
+                    .add_sized([clear_width, 0.0], egui::Button::new("Clear"))
+                    .clicked()
+                {
+                    self.cli_input.clear();
+                }
+            });
+        });
+    }
+
+    fn draw_bottom_panel(&mut self, ui: &mut Ui) {
+        let total_height = ui.available_height();
+        let gap = ui.spacing().item_spacing.y;
+        let command_panel_height = 108.0;
+        let output_section_height = (total_height - command_panel_height - gap).max(52.0);
+
+        ui.allocate_ui(
+            egui::vec2(ui.available_width(), output_section_height),
+            |ui| {
+                ui.group(|ui| {
+                    ui.heading("Last Command Output");
+                    let text_height = (output_section_height - 38.0).max(32.0);
+                    ui.add_sized(
+                        [ui.available_width(), text_height],
+                        TextEdit::multiline(&mut self.action_output)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                });
+            },
+        );
+
+        ui.add_space(gap);
+        ui.allocate_ui(
+            egui::vec2(ui.available_width(), command_panel_height),
+            |ui| {
+                self.draw_cli_input_panel(ui);
+            },
+        );
+    }
+
+    fn draw_middle_tab_selector(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.middle_tab, MiddleTab::Staging, "Staging");
+            ui.selectable_value(&mut self.middle_tab, MiddleTab::Advanced, "Advanced");
+            ui.selectable_value(
+                &mut self.middle_tab,
+                MiddleTab::Collaboration,
+                "Collaboration",
+            );
+        });
+        ui.separator();
+    }
+
+    fn draw_staging_tab(&mut self, ui: &mut Ui) {
+        ui.columns(2, |columns| {
+            columns[0].vertical(|ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("staging-left-scroll")
+                    .show(ui, |ui| {
+                        self.draw_repo_panel(ui);
+                        ui.add_space(8.0);
+                        self.draw_git_panel(ui);
+                    });
+            });
+
+            columns[1].vertical(|ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("staging-right-scroll")
+                    .show(ui, |ui| {
+                        self.draw_diff_panel(ui);
+                    });
+            });
+        });
+    }
+
+    fn draw_advanced_tab(&mut self, ui: &mut Ui) {
+        ui.columns(2, |columns| {
+            columns[0].vertical(|ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("advanced-left-scroll")
+                    .show(ui, |ui| {
+                        self.draw_history_panel(ui);
+                    });
+            });
+
+            columns[1].vertical(|ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("advanced-right-scroll")
+                    .show(ui, |ui| {
+                        self.draw_merge_panel(ui);
+                        ui.add_space(8.0);
+                        self.draw_branch_graph_panel(ui);
+                    });
+            });
+        });
+    }
+
+    fn draw_collaboration_tab(&mut self, ui: &mut Ui) {
+        ui.columns(2, |columns| {
+            columns[0].vertical(|ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("collab-left-scroll")
+                    .show(ui, |ui| {
+                        self.draw_node_panel(ui);
+                        ui.add_space(8.0);
+                        self.draw_consensus_config_panel(ui);
+                        ui.add_space(8.0);
+                        self.draw_actions_panel(ui);
+                    });
+            });
+
+            columns[1].vertical(|ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("collab-right-scroll")
+                    .show(ui, |ui| {
+                        self.draw_proposals_panel(ui);
+                        ui.add_space(8.0);
+                        self.draw_pending_panel(ui);
+                        ui.add_space(8.0);
+                        self.draw_ops_panel(ui);
+                    });
+            });
+        });
+    }
+}
+
+impl eframe::App for VcsGuiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let refresh_period = Duration::from_secs_f32(self.refresh_every_sec.max(1.0));
+        if self.auto_refresh && self.last_refresh.elapsed() >= refresh_period {
+            self.refresh();
+        }
+        ctx.request_repaint_after(Duration::from_millis(200));
+
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            self.draw_top_controls(ui);
+        });
+
+        egui::TopBottomPanel::bottom("bottom")
+            .resizable(true)
+            .default_height(230.0)
+            .min_height(170.0)
+            .show_separator_line(true)
+            .show(ctx, |ui| {
+                self.draw_bottom_panel(ui);
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.draw_middle_tab_selector(ui);
+            match self.middle_tab {
+                MiddleTab::Staging => self.draw_staging_tab(ui),
+                MiddleTab::Advanced => self.draw_advanced_tab(ui),
+                MiddleTab::Collaboration => self.draw_collaboration_tab(ui),
+            }
+        });
+    }
+}
+
+fn load_repo_data(repo: &Path) -> Result<RepoData, String> {
+    let branch = run_git(repo, &["symbolic-ref", "--short", "-q", "HEAD"])
+        .or_else(|_| run_git(repo, &["rev-parse", "--abbrev-ref", "HEAD"]))
+        .unwrap_or_else(|_| "(unknown)".to_string());
+    // Repositories with no commits have an unborn HEAD; don't fail UI loading for that.
+    let head = run_git(repo, &["rev-parse", "--verify", "HEAD"]).unwrap_or_default();
+    let status_raw = run_git(repo, &["status", "--short"])?;
+    let status_lines: Vec<String> = status_raw
+        .lines()
+        .map(|line| line.trim_end().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    let status_entries = parse_status_entries(&status_lines);
+    let branch_graph = if head.trim().is_empty() {
+        "(no commits yet)".to_string()
+    } else {
+        run_git(
+            repo,
+            &[
+                "log",
+                "--graph",
+                "--decorate",
+                "--oneline",
+                "--all",
+                "-n",
+                "120",
+            ],
+        )
+        .unwrap_or_else(|err| format!("(unable to load branch graph: {err})"))
+    };
+    let merge_in_progress = run_git(repo, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok();
+    let rebase_in_progress =
+        git_path_exists(repo, "rebase-merge") || git_path_exists(repo, "rebase-apply");
+    let cherry_pick_in_progress =
+        run_git(repo, &["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"]).is_ok();
+    let conflict_files = run_git(repo, &["diff", "--name-only", "--diff-filter=U"])
+        .unwrap_or_default()
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let recent_commits = if head.trim().is_empty() {
+        Vec::new()
+    } else {
+        parse_recent_commits(
+            &run_git(
+                repo,
+                &[
+                    "log",
+                    "--date=short",
+                    "--pretty=format:%H%x1f%h%x1f%an%x1f%ad%x1f%s",
+                    "-n",
+                    "120",
+                ],
+            )
+            .unwrap_or_default(),
+        )
+    };
+    let reflog_entries = parse_reflog_entries(
+        &run_git(
+            repo,
+            &[
+                "reflog",
+                "--date=short",
+                "--pretty=format:%h%x1f%gd%x1f%gs%x1f%ad",
+                "-n",
+                "120",
+            ],
+        )
+        .unwrap_or_default(),
+    );
+
+    Ok(RepoData {
+        branch: branch.trim().to_string(),
+        head: head.trim().to_string(),
+        status_lines,
+        status_entries,
+        branch_graph,
+        merge_in_progress,
+        rebase_in_progress,
+        cherry_pick_in_progress,
+        conflict_files,
+        recent_commits,
+        reflog_entries,
+    })
+}
+
+fn parse_status_entries(lines: &[String]) -> Vec<StatusEntry> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let trimmed = line.trim_end();
+            if trimmed.len() < 3 {
+                return None;
+            }
+            let code = trimmed[0..2].to_string();
+            let raw_path = trimmed[3..].trim();
+            let path = normalize_status_path(raw_path);
+            if path.is_empty() {
+                return None;
+            }
+            Some(StatusEntry { code, path })
+        })
+        .collect()
+}
+
+fn normalize_status_path(value: &str) -> String {
+    let target = value.split(" -> ").last().unwrap_or(value).trim();
+    if target.starts_with('"') && target.ends_with('"') && target.len() >= 2 {
+        target[1..target.len() - 1].to_string()
+    } else {
+        target.to_string()
+    }
+}
+
+fn load_diff_output(repo: &Path, path: &str, staged: bool) -> Result<String, String> {
+    if !repo.exists() {
+        return Ok("(repository path does not exist)".to_string());
+    }
+
+    let mut args = vec!["diff"];
+    if staged {
+        args.push("--cached");
+    }
+    let scope = path.trim();
+    if !scope.is_empty() {
+        args.push("--");
+        args.push(scope);
+    }
+
+    let output = run_git(repo, &args)?;
+    if output.trim().is_empty() {
+        let mode = if staged { "staged" } else { "working tree" };
+        if scope.is_empty() {
+            Ok(format!("(no {mode} changes)"))
+        } else {
+            Ok(format!("(no {mode} changes for {scope})"))
+        }
+    } else {
+        Ok(output)
+    }
+}
+
+fn git_path_exists(repo: &Path, git_path_name: &str) -> bool {
+    resolve_git_path(repo, git_path_name)
+        .map(|path| path.exists())
+        .unwrap_or(false)
+}
+
+fn parse_recent_commits(raw: &str) -> Vec<CommitSummary> {
+    raw.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\u{1f}');
+            let hash = parts.next()?.trim().to_string();
+            let short_hash = parts.next()?.trim().to_string();
+            let author = parts.next()?.trim().to_string();
+            let date = parts.next()?.trim().to_string();
+            let subject = parts.next().unwrap_or("").trim().to_string();
+            if hash.is_empty() {
+                return None;
+            }
+            Some(CommitSummary {
+                hash,
+                short_hash,
+                author,
+                date,
+                subject,
+            })
+        })
+        .collect()
+}
+
+fn parse_reflog_entries(raw: &str) -> Vec<ReflogEntry> {
+    raw.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\u{1f}');
+            let short_hash = parts.next()?.trim().to_string();
+            let selector = parts.next()?.trim().to_string();
+            let subject = parts.next()?.trim().to_string();
+            let date = parts.next().unwrap_or("").trim().to_string();
+            if selector.is_empty() {
+                return None;
+            }
+            Some(ReflogEntry {
+                short_hash,
+                selector,
+                subject,
+                date,
+            })
+        })
+        .collect()
+}
+
+fn resolve_vcs_binary(configured: &str, repo: &Path) -> String {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return String::new();
+    }
+
+    let configured_path = PathBuf::from(configured);
+    if configured_path.is_absolute() {
+        return configured.to_string();
+    }
+
+    if configured_path.components().count() > 1 {
+        let repo_relative = repo.join(&configured_path);
+        if repo_relative.exists() {
+            return repo_relative.to_string_lossy().to_string();
+        }
+        return configured.to_string();
+    }
+
+    let repo_candidate = repo.join(configured);
+    if repo_candidate.exists() {
+        return repo_candidate.to_string_lossy().to_string();
+    }
+
+    configured.to_string()
+}
+
+fn allowed_vcs_commands() -> &'static [&'static str] {
+    &[
+        "help",
+        "init",
+        "status",
+        "log",
+        "branch",
+        "checkout",
+        "stage",
+        "unstage",
+        "commit",
+        "amend",
+        "revert",
+        "push",
+        "pull",
+        "squash",
+        "peer",
+        "op",
+        "sync",
+        "daemon",
+        "consensus",
+    ]
+}
+
+fn is_allowed_vcs_command(cmd: &str) -> bool {
+    allowed_vcs_commands().iter().any(|allowed| *allowed == cmd)
+}
+
+fn parse_cli_tokens(input: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+
+    for ch in input.chars() {
+        if escape {
+            current.push(ch);
+            escape = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escape = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if ch.is_whitespace() && !in_single && !in_double {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+
+    if escape {
+        return Err("CLI parse error: trailing escape (`\\`)".to_string());
+    }
+    if in_single || in_double {
+        return Err("CLI parse error: unclosed quote".to_string());
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+fn resolve_repo_relative_path(repo: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    let relative = relative_path.trim();
+    if relative.is_empty() {
+        return Err("path cannot be empty".to_string());
+    }
+    let repo_abs = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    let candidate = repo.join(relative);
+    if let Ok(candidate_abs) = candidate.canonicalize() {
+        if !candidate_abs.starts_with(&repo_abs) {
+            return Err(format!(
+                "refusing to access path outside repository: {}",
+                candidate_abs.display()
+            ));
+        }
+        Ok(candidate_abs)
+    } else {
+        Ok(candidate)
+    }
+}
+
+fn parse_conflict_sections(raw: &str) -> Result<Vec<ConflictSection>, String> {
+    let lines = raw
+        .split_inclusive('\n')
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut sections = Vec::new();
+    let mut plain = String::new();
+    let mut idx = 0usize;
+
+    while idx < lines.len() {
+        let line = &lines[idx];
+        if line.starts_with("<<<<<<<") {
+            if !plain.is_empty() {
+                sections.push(ConflictSection::Plain(std::mem::take(&mut plain)));
+            }
+
+            idx += 1;
+            let mut ours = Vec::new();
+            while idx < lines.len() && !lines[idx].starts_with("=======") {
+                ours.push(lines[idx].clone());
+                idx += 1;
+            }
+            if idx >= lines.len() {
+                return Err("conflict parse error: missing `=======` marker".to_string());
+            }
+
+            idx += 1;
+            let mut theirs = Vec::new();
+            while idx < lines.len() && !lines[idx].starts_with(">>>>>>>") {
+                theirs.push(lines[idx].clone());
+                idx += 1;
+            }
+            if idx >= lines.len() {
+                return Err("conflict parse error: missing `>>>>>>>` marker".to_string());
+            }
+
+            idx += 1;
+            let max_lines = ours.len().max(theirs.len());
+            let mut choices = Vec::with_capacity(max_lines);
+            for line_idx in 0..max_lines {
+                if line_idx < ours.len() {
+                    choices.push(ConflictLineSource::Ours);
+                } else {
+                    choices.push(ConflictLineSource::Theirs);
+                }
+            }
+            sections.push(ConflictSection::Hunk(ConflictHunk {
+                ours_lines: ours,
+                theirs_lines: theirs,
+                choices,
+            }));
+        } else {
+            plain.push_str(line);
+            idx += 1;
+        }
+    }
+
+    if !plain.is_empty() {
+        sections.push(ConflictSection::Plain(plain));
+    }
+    Ok(sections)
+}
+
+fn compose_conflict_editor_output(sections: &[ConflictSection]) -> String {
+    let mut out = String::new();
+    for section in sections {
+        match section {
+            ConflictSection::Plain(text) => out.push_str(text),
+            ConflictSection::Hunk(hunk) => {
+                let max_lines = hunk.ours_lines.len().max(hunk.theirs_lines.len());
+                for idx in 0..max_lines {
+                    let choice = hunk
+                        .choices
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(ConflictLineSource::Ours);
+                    match choice {
+                        ConflictLineSource::Ours => {
+                            if let Some(line) = hunk.ours_lines.get(idx) {
+                                out.push_str(line);
+                            }
+                        }
+                        ConflictLineSource::Theirs => {
+                            if let Some(line) = hunk.theirs_lines.get(idx) {
+                                out.push_str(line);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn apply_conflict_choice_to_all_hunks(
+    sections: &mut [ConflictSection],
+    source: ConflictLineSource,
+) {
+    for section in sections {
+        if let ConflictSection::Hunk(hunk) = section {
+            for choice in &mut hunk.choices {
+                *choice = source;
+            }
+        }
+    }
+}
+
+fn load_conflict_editor_state(
+    repo: &Path,
+    relative_path: &str,
+) -> Result<ConflictEditorState, String> {
+    let relative_path = relative_path.trim();
+    if relative_path.is_empty() {
+        return Err("Select a conflict file first".to_string());
+    }
+    let path = resolve_repo_relative_path(repo, relative_path)?;
+    let raw = fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let sections = parse_conflict_sections(&raw)?;
+    Ok(ConflictEditorState {
+        file_path: relative_path.to_string(),
+        sections,
+        parse_error: String::new(),
+    })
+}
+
+fn resolve_git_path(repo: &Path, git_path_name: &str) -> Option<PathBuf> {
+    let git_path = run_git(repo, &["rev-parse", "--git-path", git_path_name]).ok()?;
+    let git_path = git_path.trim();
+    if git_path.is_empty() {
+        return None;
+    }
+    let resolved = PathBuf::from(git_path);
+    if resolved.is_absolute() {
+        Some(resolved)
+    } else {
+        Some(repo.join(resolved))
+    }
+}
+
+fn find_current_rebase_todo_path(repo: &Path) -> Option<PathBuf> {
+    for candidate in [
+        "rebase-merge/git-rebase-todo",
+        "rebase-apply/git-rebase-todo",
+    ] {
+        if let Some(path) = resolve_git_path(repo, candidate) {
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn build_rebase_todo_text(repo: &Path, onto: &str) -> Result<String, String> {
+    let onto = onto.trim();
+    if onto.is_empty() {
+        return Err("Rebase target cannot be empty".to_string());
+    }
+    let range = format!("{onto}..HEAD");
+    let raw = run_git(
+        repo,
+        &["log", "--reverse", "--pretty=format:pick %H %s", &range],
+    )?;
+    if raw.trim().is_empty() {
+        return Err(format!("No commits found for range {range}"));
+    }
+    if raw.ends_with('\n') {
+        Ok(raw)
+    } else {
+        Ok(format!("{raw}\n"))
+    }
+}
+
+fn validate_rebase_todo_text(todo: &str) -> Result<(), String> {
+    let allowed = [
+        "pick", "reword", "edit", "squash", "fixup", "drop", "break", "exec", "label", "reset",
+        "merge", "noop",
+    ];
+    let mut action_lines = 0usize;
+    for (idx, line) in todo.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let command = trimmed.split_whitespace().next().unwrap_or_default();
+        if !allowed.contains(&command) {
+            return Err(format!(
+                "Invalid rebase todo command on line {}: {}",
+                idx + 1,
+                command
+            ));
+        }
+        action_lines += 1;
+    }
+    if action_lines == 0 {
+        return Err("Rebase todo is empty".to_string());
+    }
+    Ok(())
+}
+
+fn read_current_rebase_todo(repo: &Path) -> Result<(PathBuf, String), String> {
+    let path = find_current_rebase_todo_path(repo).ok_or_else(|| {
+        "No active interactive rebase todo file found. Start an interactive rebase first."
+            .to_string()
+    })?;
+    let raw = fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    Ok((path, raw))
+}
+
+fn write_current_rebase_todo(repo: &Path, todo: &str) -> Result<PathBuf, String> {
+    let path = find_current_rebase_todo_path(repo).ok_or_else(|| {
+        "No active interactive rebase todo file found. Start an interactive rebase first."
+            .to_string()
+    })?;
+    fs::write(&path, todo).map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+fn write_temp_rebase_todo(todo: &str) -> Result<PathBuf, String> {
+    let mut path = std::env::temp_dir();
+    let nanos = Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000);
+    path.push(format!(
+        "vcs-gui-rebase-todo-{}-{}.txt",
+        std::process::id(),
+        nanos
+    ));
+    fs::write(&path, todo).map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+fn write_sequence_editor_script(repo: &Path) -> Result<PathBuf, String> {
+    let script_path = repo.join(".vcs").join("gui_sequence_editor.sh");
+    if let Some(parent) = script_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    let script = r#"#!/bin/sh
+if [ -z "${VCS_GUI_REBASE_TODO}" ]; then
+  echo "VCS_GUI_REBASE_TODO is not set" >&2
+  exit 1
+fi
+if [ -z "$1" ]; then
+  echo "missing git rebase todo path" >&2
+  exit 1
+fi
+cp "${VCS_GUI_REBASE_TODO}" "$1"
+"#;
+    fs::write(&script_path, script)
+        .map_err(|err| format!("failed to write {}: {err}", script_path.display()))?;
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&script_path)
+            .map_err(|err| format!("failed to stat {}: {err}", script_path.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms)
+            .map_err(|err| format!("failed to chmod {}: {err}", script_path.display()))?;
+    }
+    Ok(script_path)
+}
+
+fn build_interactive_rebase_args(
+    onto: &str,
+    autosquash: bool,
+    autostash: bool,
+    rebase_merges: bool,
+) -> Result<Vec<String>, String> {
+    let mut args = build_rebase_args(onto, autosquash, autostash, rebase_merges)?;
+    args.insert(1, "-i".to_string());
+    Ok(args)
+}
+
+fn build_path_action_args(
+    cmd: &str,
+    path: &str,
+    empty_path_message: &str,
+) -> Result<Vec<String>, String> {
+    let target = path.trim();
+    if target.is_empty() {
+        return Err(empty_path_message.to_string());
+    }
+    Ok(vec![cmd.to_string(), target.to_string()])
+}
+
+fn build_commit_args(message: &str, all: bool) -> Result<Vec<String>, String> {
+    let msg = message.trim();
+    if msg.is_empty() {
+        return Err("Commit message cannot be empty".to_string());
+    }
+
+    let mut args = vec!["commit".to_string()];
+    if all {
+        args.push("-a".to_string());
+    }
+    args.push("-m".to_string());
+    args.push(msg.to_string());
+    Ok(args)
+}
+
+fn build_amend_args(message: &str) -> Vec<String> {
+    let msg = message.trim();
+    if msg.is_empty() {
+        vec!["amend".to_string(), "--no-edit".to_string()]
+    } else {
+        vec!["amend".to_string(), "-m".to_string(), msg.to_string()]
+    }
+}
+
+fn build_checkout_args(target: &str) -> Result<Vec<String>, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("Checkout target cannot be empty".to_string());
+    }
+    Ok(vec!["checkout".to_string(), target.to_string()])
+}
+
+fn build_revert_args(target: &str, no_commit: bool) -> Result<Vec<String>, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("Revert target cannot be empty".to_string());
+    }
+    let mut args = vec!["revert".to_string()];
+    if no_commit {
+        args.push("--no-commit".to_string());
+    }
+    args.push(target.to_string());
+    Ok(args)
+}
+
+fn build_squash_args(
+    last: &str,
+    from: &str,
+    message: &str,
+    allow_dirty: bool,
+) -> Result<Vec<String>, String> {
+    let msg = message.trim();
+    if msg.is_empty() {
+        return Err("Squash message cannot be empty".to_string());
+    }
+
+    let last = last.trim();
+    let from = from.trim();
+    let use_last = !last.is_empty();
+    let use_from = !from.is_empty();
+    if use_last == use_from {
+        return Err("Provide exactly one of Squash Last or Squash From".to_string());
+    }
+
+    let mut args = vec!["squash".to_string()];
+    if use_last {
+        args.push("--last".to_string());
+        args.push(last.to_string());
+    } else {
+        args.push("--from".to_string());
+        args.push(from.to_string());
+    }
+    if allow_dirty {
+        args.push("--allow-dirty".to_string());
+    }
+    args.push("-m".to_string());
+    args.push(msg.to_string());
+    Ok(args)
+}
+
+fn build_consensus_config_args(
+    threshold: &str,
+    members_csv: &str,
+    clear_members: bool,
+) -> Result<Vec<String>, String> {
+    let threshold = threshold.trim();
+    if threshold.is_empty() {
+        return Err("Threshold cannot be empty".to_string());
+    }
+
+    let mut args = vec![
+        "consensus".to_string(),
+        "config".to_string(),
+        "--threshold".to_string(),
+        threshold.to_string(),
+    ];
+    if clear_members {
+        args.push("--clear-members".to_string());
+    } else {
+        let members = members_csv.trim();
+        if !members.is_empty() {
+            args.push("--members".to_string());
+            args.push(members.to_string());
+        }
+    }
+    Ok(args)
+}
+
+fn build_merge_start_args(target: &str) -> Result<Vec<String>, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("Merge target cannot be empty".to_string());
+    }
+    Ok(vec!["merge".to_string(), target.to_string()])
+}
+
+fn build_conflict_resolution_args(strategy: &str, path: &str) -> Result<Vec<String>, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("Select a conflict file first".to_string());
+    }
+    let strategy = strategy.trim();
+    if strategy != "--ours" && strategy != "--theirs" {
+        return Err("Unknown conflict strategy".to_string());
+    }
+    Ok(vec![
+        "checkout".to_string(),
+        strategy.to_string(),
+        "--".to_string(),
+        path.to_string(),
+    ])
+}
+
+fn build_git_add_path_args(path: &str) -> Result<Vec<String>, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("Select a conflict file first".to_string());
+    }
+    Ok(vec!["add".to_string(), "--".to_string(), path.to_string()])
+}
+
+fn build_merge_commit_args(message: &str) -> Result<Vec<String>, String> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err("Merge commit message cannot be empty".to_string());
+    }
+    Ok(vec![
+        "commit".to_string(),
+        "-m".to_string(),
+        message.to_string(),
+    ])
+}
+
+fn build_rebase_args(
+    onto: &str,
+    autosquash: bool,
+    autostash: bool,
+    rebase_merges: bool,
+) -> Result<Vec<String>, String> {
+    let onto = onto.trim();
+    if onto.is_empty() {
+        return Err("Rebase target cannot be empty".to_string());
+    }
+    let mut args = vec!["rebase".to_string()];
+    if autosquash {
+        args.push("--autosquash".to_string());
+    }
+    if autostash {
+        args.push("--autostash".to_string());
+    }
+    if rebase_merges {
+        args.push("--rebase-merges".to_string());
+    }
+    args.push(onto.to_string());
+    Ok(args)
+}
+
+fn parse_ref_list(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| ch.is_whitespace() || ch == ',')
+        .map(|token| token.trim())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_string())
+        .collect()
+}
+
+fn build_cherry_pick_args(refs: &str, no_commit: bool) -> Result<Vec<String>, String> {
+    let refs = parse_ref_list(refs);
+    if refs.is_empty() {
+        return Err("Cherry-pick requires at least one commit/ref".to_string());
+    }
+    let mut args = vec!["cherry-pick".to_string()];
+    if no_commit {
+        args.push("--no-commit".to_string());
+    }
+    args.extend(refs);
+    Ok(args)
+}
+
+fn build_reset_args(
+    target: &str,
+    mode: ResetMode,
+    hard_reset_confirmed: bool,
+) -> Result<Vec<String>, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("Reset target cannot be empty".to_string());
+    }
+    if mode == ResetMode::Hard && !hard_reset_confirmed {
+        return Err("Confirm hard reset before running it".to_string());
+    }
+    Ok(vec![
+        "reset".to_string(),
+        mode.as_str().to_string(),
+        target.to_string(),
+    ])
+}
+
+fn load_gossip_data(repo: &Path) -> Result<GossipData, String> {
+    let root = repo.join(".vcs").join("gossip");
+    if !root.exists() {
+        return Ok(GossipData::default());
+    }
+
+    let identity: Option<IdentityFile> = read_json_if_exists(&root.join("identity.json"))?;
+    let peers: Option<PeersFile> = read_json_if_exists(&root.join("peers.json"))?;
+    let config: Option<ConsensusConfigFile> = read_json_if_exists(&root.join("consensus.json"))?;
+    let pending: Option<PendingPushFile> = read_json_if_exists(&root.join("pending_pushes.json"))?;
+    let ops = read_ops_log(&root.join("ops.log"))?;
+
+    let mut gossip = GossipData::default();
+    gossip.node_id = identity.map(|i| i.node_id).unwrap_or_default();
+    gossip.peers = peers.map(|p| p.peers).unwrap_or_default();
+    gossip.ops = ops;
+    gossip.pending_pushes = pending.map(|p| p.pushes).unwrap_or_default();
+    gossip.consensus_threshold = config.as_ref().map(|c| c.threshold).unwrap_or(0.5);
+    if gossip.consensus_threshold == 0.0 {
+        gossip.consensus_threshold = 0.5;
+    }
+    gossip.consensus_members = config.map(|c| c.members).unwrap_or_default();
+    Ok(gossip)
+}
+
+fn compute_proposal_views(gossip: &GossipData) -> Vec<ProposalView> {
+    let mut proposals: HashMap<String, ProposalView> = HashMap::new();
+    let mut vote_by_proposal: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut cert_by_proposal: HashMap<String, bool> = HashMap::new();
+
+    for op in &gossip.ops {
+        match op.op_type.as_str() {
+            "consensus.proposal" => {
+                if let Ok(payload) = serde_json::from_value::<ProposalPayload>(op.payload.clone()) {
+                    if payload.proposal_id.trim().is_empty() {
+                        continue;
+                    }
+                    proposals.insert(
+                        payload.proposal_id.clone(),
+                        ProposalView {
+                            proposal_id: payload.proposal_id,
+                            reference: payload.reference,
+                            old_oid: payload.old_oid,
+                            new_oid: payload.new_oid,
+                            epoch: payload.epoch,
+                            proposer: op.author.clone(),
+                            created_at: op.timestamp.clone(),
+                            expires_at: payload.expires_at,
+                            ..ProposalView::default()
+                        },
+                    );
+                }
+            }
+            "consensus.vote" => {
+                if let Ok(payload) = serde_json::from_value::<VotePayload>(op.payload.clone()) {
+                    if payload.proposal_id.trim().is_empty() || op.author.trim().is_empty() {
+                        continue;
+                    }
+                    vote_by_proposal
+                        .entry(payload.proposal_id)
+                        .or_default()
+                        .insert(op.author.clone(), payload.decision.to_lowercase());
+                }
+            }
+            "consensus.cert" => {
+                if let Ok(payload) = serde_json::from_value::<CertPayload>(op.payload.clone()) {
+                    if payload.proposal_id.trim().is_empty() {
+                        continue;
+                    }
+                    cert_by_proposal.insert(payload.proposal_id, payload.certified);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut all_authors = HashSet::new();
+    for op in &gossip.ops {
+        if !op.author.trim().is_empty() {
+            all_authors.insert(op.author.clone());
+        }
+    }
+    if !gossip.node_id.trim().is_empty() {
+        all_authors.insert(gossip.node_id.clone());
+    }
+
+    let mut out = Vec::with_capacity(proposals.len());
+    for (proposal_id, mut p) in proposals {
+        let members = if gossip.consensus_members.is_empty() {
+            all_authors.iter().cloned().collect::<Vec<_>>()
+        } else {
+            gossip.consensus_members.clone()
+        };
+        let member_set = members.iter().cloned().collect::<HashSet<_>>();
+        let voters = vote_by_proposal
+            .get(&proposal_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut yes = 0usize;
+        let mut no = 0usize;
+        for (author, decision) in voters {
+            if !member_set.contains(&author) {
+                continue;
+            }
+            match decision.as_str() {
+                "yes" => yes += 1,
+                "no" => no += 1,
+                _ => {}
+            }
+        }
+
+        let voter_count = members.len().max(1);
+        let required_yes = (((gossip.consensus_threshold * voter_count as f64).floor()) as usize
+            + 1)
+        .clamp(1, voter_count);
+        let quorum = yes >= required_yes;
+        let certified = cert_by_proposal.get(&proposal_id).copied().unwrap_or(false);
+        let expired = if p.expires_at.trim().is_empty() {
+            false
+        } else {
+            parse_ts(&p.expires_at)
+                .map(|dt| Utc::now() > dt)
+                .unwrap_or(false)
+        };
+
+        p.yes_votes = yes;
+        p.no_votes = no;
+        p.voters = voter_count;
+        p.required_yes = required_yes;
+        p.quorum = quorum;
+        p.certified = certified;
+        p.expired = expired;
+        out.push(p);
+    }
+
+    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    out
+}
+
+fn read_json_if_exists<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let decoded = serde_json::from_str::<T>(&raw)
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    Ok(Some(decoded))
+}
+
+fn read_ops_log(path: &Path) -> Result<Vec<Operation>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let mut ops = Vec::new();
+    for (idx, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Operation>(trimmed) {
+            Ok(op) => ops.push(op),
+            Err(err) => {
+                return Err(format!(
+                    "failed to parse {} line {}: {err}",
+                    path.display(),
+                    idx + 1
+                ))
+            }
+        }
+    }
+    Ok(ops)
+}
+
+fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|err| format!("failed to execute git: {err}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            format!("git {:?} failed: {}", args, output.status)
+        } else {
+            format!("git {:?} failed: {}", args, stderr)
+        })
+    }
+}
+
+fn guess_repo_root() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    if cwd.join("go.mod").exists() && cwd.join("main.go").exists() {
+        return Some(cwd);
+    }
+    if cwd.file_name().and_then(|s| s.to_str()) == Some("gui") {
+        let parent = cwd.parent()?.to_path_buf();
+        if parent.join("go.mod").exists() {
+            return Some(parent);
+        }
+    }
+    Some(cwd)
+}
+
+fn default_vcs_binary(repo_root: PathBuf) -> PathBuf {
+    let candidate = repo_root.join("vcs");
+    if candidate.exists() {
+        candidate
+    } else {
+        PathBuf::from("vcs")
+    }
+}
+
+fn parse_ts(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn short_hash(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "-".to_string();
+    }
+    if trimmed.len() <= 12 {
+        return trimmed.to_string();
+    }
+    trimmed.chars().take(12).collect()
+}
+
+fn non_empty(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "-".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_args_include_message() {
+        let args = build_commit_args("ship it", false).expect("commit args should build");
+        assert_eq!(args, vec!["commit", "-m", "ship it"]);
+    }
+
+    #[test]
+    fn commit_all_args_include_all_flag() {
+        let args = build_commit_args("ship it", true).expect("commit-all args should build");
+        assert_eq!(args, vec!["commit", "-a", "-m", "ship it"]);
+    }
+
+    #[test]
+    fn commit_args_require_message() {
+        let err = build_commit_args("   ", false).expect_err("empty commit message should fail");
+        assert_eq!(err, "Commit message cannot be empty");
+    }
+
+    #[test]
+    fn amend_defaults_to_no_edit() {
+        let args = build_amend_args(" ");
+        assert_eq!(args, vec!["amend", "--no-edit"]);
+    }
+
+    #[test]
+    fn amend_with_message_uses_m_flag() {
+        let args = build_amend_args("rewrite");
+        assert_eq!(args, vec!["amend", "-m", "rewrite"]);
+    }
+
+    #[test]
+    fn checkout_requires_target() {
+        let err = build_checkout_args(" ").expect_err("missing checkout target should fail");
+        assert_eq!(err, "Checkout target cannot be empty");
+    }
+
+    #[test]
+    fn checkout_builds_expected_args() {
+        let args = build_checkout_args("feature/x").expect("checkout args should build");
+        assert_eq!(args, vec!["checkout", "feature/x"]);
+    }
+
+    #[test]
+    fn revert_builds_expected_args() {
+        let args = build_revert_args("abc123", false).expect("revert args should build");
+        assert_eq!(args, vec!["revert", "abc123"]);
+    }
+
+    #[test]
+    fn revert_no_commit_builds_expected_args() {
+        let args = build_revert_args("abc123", true).expect("revert args should build");
+        assert_eq!(args, vec!["revert", "--no-commit", "abc123"]);
+    }
+
+    #[test]
+    fn squash_from_last_builds_expected_args() {
+        let args =
+            build_squash_args("3", "", "squashed", false).expect("squash --last args should build");
+        assert_eq!(args, vec!["squash", "--last", "3", "-m", "squashed"]);
+    }
+
+    #[test]
+    fn squash_from_commit_builds_expected_args() {
+        let args = build_squash_args("", "base123", "squashed", true)
+            .expect("squash --from args should build");
+        assert_eq!(
+            args,
+            vec![
+                "squash",
+                "--from",
+                "base123",
+                "--allow-dirty",
+                "-m",
+                "squashed"
+            ]
+        );
+    }
+
+    #[test]
+    fn squash_requires_message() {
+        let err =
+            build_squash_args("2", "", "  ", false).expect_err("empty squash message should fail");
+        assert_eq!(err, "Squash message cannot be empty");
+    }
+
+    #[test]
+    fn squash_requires_exactly_one_selector() {
+        let err = build_squash_args("", "", "msg", false)
+            .expect_err("missing squash selector should fail");
+        assert_eq!(err, "Provide exactly one of Squash Last or Squash From");
+
+        let err = build_squash_args("2", "base", "msg", false)
+            .expect_err("multiple squash selectors should fail");
+        assert_eq!(err, "Provide exactly one of Squash Last or Squash From");
+    }
+
+    #[test]
+    fn consensus_config_with_members_builds_expected_args() {
+        let args = build_consensus_config_args("0.67", "nodeA,nodeB", false)
+            .expect("config args should build");
+        assert_eq!(
+            args,
+            vec![
+                "consensus",
+                "config",
+                "--threshold",
+                "0.67",
+                "--members",
+                "nodeA,nodeB"
+            ]
+        );
+    }
+
+    #[test]
+    fn consensus_config_clear_members_builds_expected_args() {
+        let args = build_consensus_config_args("0.67", "ignored", true)
+            .expect("config clear-members args should build");
+        assert_eq!(
+            args,
+            vec![
+                "consensus",
+                "config",
+                "--threshold",
+                "0.67",
+                "--clear-members"
+            ]
+        );
+    }
+
+    #[test]
+    fn consensus_config_requires_threshold() {
+        let err = build_consensus_config_args(" ", "nodeA", false)
+            .expect_err("missing threshold should fail");
+        assert_eq!(err, "Threshold cannot be empty");
+    }
+
+    #[test]
+    fn parse_status_entries_handles_rename_and_quotes() {
+        let lines = vec![
+            " M gui/src/main.rs".to_string(),
+            "R  \"old name.txt\" -> \"new name.txt\"".to_string(),
+        ];
+        let entries = parse_status_entries(&lines);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].code, " M");
+        assert_eq!(entries[0].path, "gui/src/main.rs");
+        assert_eq!(entries[1].code, "R ");
+        assert_eq!(entries[1].path, "new name.txt");
+    }
+
+    #[test]
+    fn merge_start_requires_target() {
+        let err = build_merge_start_args(" ").expect_err("empty merge target should fail");
+        assert_eq!(err, "Merge target cannot be empty");
+    }
+
+    #[test]
+    fn merge_start_builds_expected_args() {
+        let args = build_merge_start_args("feature").expect("merge args should build");
+        assert_eq!(args, vec!["merge", "feature"]);
+    }
+
+    #[test]
+    fn conflict_resolution_builds_expected_args() {
+        let args = build_conflict_resolution_args("--ours", "README.md")
+            .expect("conflict args should build");
+        assert_eq!(args, vec!["checkout", "--ours", "--", "README.md"]);
+    }
+
+    #[test]
+    fn conflict_resolution_rejects_unknown_strategy() {
+        let err = build_conflict_resolution_args("--bad", "README.md")
+            .expect_err("bad conflict strategy should fail");
+        assert_eq!(err, "Unknown conflict strategy");
+    }
+
+    #[test]
+    fn git_add_path_requires_value() {
+        let err = build_git_add_path_args(" ").expect_err("empty add path should fail");
+        assert_eq!(err, "Select a conflict file first");
+    }
+
+    #[test]
+    fn merge_commit_requires_message() {
+        let err = build_merge_commit_args(" ").expect_err("empty merge commit msg should fail");
+        assert_eq!(err, "Merge commit message cannot be empty");
+    }
+
+    #[test]
+    fn rebase_builds_expected_args() {
+        let args = build_rebase_args("main", true, false, true).expect("rebase args should build");
+        assert_eq!(
+            args,
+            vec!["rebase", "--autosquash", "--rebase-merges", "main"]
+        );
+    }
+
+    #[test]
+    fn cherry_pick_accepts_comma_or_space_refs() {
+        let args = build_cherry_pick_args("abc123, def456 ghi789", true)
+            .expect("cherry-pick should build");
+        assert_eq!(
+            args,
+            vec!["cherry-pick", "--no-commit", "abc123", "def456", "ghi789"]
+        );
+    }
+
+    #[test]
+    fn cherry_pick_requires_refs() {
+        let err = build_cherry_pick_args("   ", false).expect_err("missing refs should fail");
+        assert_eq!(err, "Cherry-pick requires at least one commit/ref");
+    }
+
+    #[test]
+    fn reset_hard_requires_confirmation() {
+        let err = build_reset_args("HEAD~2", ResetMode::Hard, false)
+            .expect_err("hard reset without confirmation should fail");
+        assert_eq!(err, "Confirm hard reset before running it");
+    }
+
+    #[test]
+    fn reset_soft_builds_expected_args() {
+        let args =
+            build_reset_args("HEAD~1", ResetMode::Soft, false).expect("soft reset should build");
+        assert_eq!(args, vec!["reset", "--soft", "HEAD~1"]);
+    }
+
+    #[test]
+    fn parse_recent_commits_parses_rows() {
+        let raw =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x1faaaaaaa\x1fSid\x1f2026-02-08\x1ffeat: x";
+        let commits = parse_recent_commits(raw);
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].hash, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(commits[0].short_hash, "aaaaaaa");
+        assert_eq!(commits[0].author, "Sid");
+        assert_eq!(commits[0].date, "2026-02-08");
+        assert_eq!(commits[0].subject, "feat: x");
+    }
+
+    #[test]
+    fn parse_reflog_entries_parses_rows() {
+        let raw = "aaaaaaa\x1fHEAD@{0}\x1fcommit: feat\x1f2026-02-08";
+        let entries = parse_reflog_entries(raw);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].short_hash, "aaaaaaa");
+        assert_eq!(entries[0].selector, "HEAD@{0}");
+        assert_eq!(entries[0].subject, "commit: feat");
+        assert_eq!(entries[0].date, "2026-02-08");
+    }
+
+    #[test]
+    fn cli_parser_handles_quotes() {
+        let tokens = parse_cli_tokens("commit -m \"hello world\"").expect("tokens should parse");
+        assert_eq!(tokens, vec!["commit", "-m", "hello world"]);
+    }
+
+    #[test]
+    fn cli_parser_rejects_unclosed_quote() {
+        let err = parse_cli_tokens("commit -m \"oops").expect_err("unclosed quote should fail");
+        assert!(err.contains("unclosed quote"));
+    }
+
+    #[test]
+    fn allowed_vcs_command_checks_first_token() {
+        assert!(is_allowed_vcs_command("status"));
+        assert!(!is_allowed_vcs_command("rm"));
+    }
+
+    #[test]
+    fn conflict_parser_and_composer_work_line_by_line() {
+        let raw = "prefix\n<<<<<<< HEAD\na\nb\n=======\nx\ny\n>>>>>>> branch\nsuffix\n";
+        let mut sections = parse_conflict_sections(raw).expect("conflict should parse");
+        assert_eq!(sections.len(), 3);
+
+        match &mut sections[1] {
+            ConflictSection::Hunk(hunk) => {
+                assert_eq!(hunk.ours_lines.len(), 2);
+                assert_eq!(hunk.theirs_lines.len(), 2);
+                hunk.choices[0] = ConflictLineSource::Theirs;
+                hunk.choices[1] = ConflictLineSource::Ours;
+            }
+            _ => panic!("expected a conflict hunk"),
+        }
+
+        let resolved = compose_conflict_editor_output(&sections);
+        assert_eq!(resolved, "prefix\nx\nb\nsuffix\n");
+    }
+
+    #[test]
+    fn interactive_rebase_args_include_i() {
+        let args = build_interactive_rebase_args("main", true, false, false)
+            .expect("interactive args should build");
+        assert_eq!(args, vec!["rebase", "-i", "--autosquash", "main"]);
+    }
+
+    #[test]
+    fn validate_rebase_todo_rejects_bad_opcode() {
+        let err = validate_rebase_todo_text("pick abc first\nbad abc second\n")
+            .expect_err("bad opcode should fail");
+        assert!(err.contains("Invalid rebase todo command"));
+    }
+
+    #[test]
+    fn validate_rebase_todo_accepts_comments_and_actions() {
+        validate_rebase_todo_text("# comment\npick abc first\nexec echo ok\n")
+            .expect("todo should validate");
+    }
+
+    #[test]
+    fn resolve_vcs_binary_prefers_repo_local_binary_for_bare_name() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "vcs-gui-test-{}",
+            Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000)
+        ));
+        fs::create_dir_all(&temp_root).expect("temp dir should be created");
+        let local_vcs = temp_root.join("vcs");
+        fs::write(&local_vcs, b"#!/bin/sh\n").expect("temp binary should be written");
+
+        let resolved = resolve_vcs_binary("vcs", &temp_root);
+        assert_eq!(resolved, local_vcs.to_string_lossy().to_string());
+
+        let _ = fs::remove_file(local_vcs);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn resolve_vcs_binary_uses_configured_relative_path_when_present() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "vcs-gui-test-{}",
+            Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000)
+        ));
+        let nested_dir = temp_root.join("bin");
+        fs::create_dir_all(&nested_dir).expect("nested dir should be created");
+        let nested_vcs = nested_dir.join("vcs");
+        fs::write(&nested_vcs, b"#!/bin/sh\n").expect("temp binary should be written");
+
+        let resolved = resolve_vcs_binary("bin/vcs", &temp_root);
+        assert_eq!(resolved, nested_vcs.to_string_lossy().to_string());
+
+        let _ = fs::remove_file(nested_vcs);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+}

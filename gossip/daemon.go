@@ -1,0 +1,228 @@
+package gossip
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"time"
+)
+
+// DaemonConfig controls gossip server behavior.
+type DaemonConfig struct {
+	ListenAddr     string
+	GossipInterval time.Duration
+	SyncLimit      int
+	MaxSyncRounds  int
+	HTTPClient     *http.Client
+	Logger         *log.Logger
+}
+
+// NodeInfo describes local daemon state.
+type NodeInfo struct {
+	NodeID  string            `json:"node_id"`
+	Peers   []string          `json:"peers"`
+	Summary map[string]uint64 `json:"summary"`
+}
+
+// RunDaemon starts the HTTP sync server and periodic gossip loop.
+func RunDaemon(ctx context.Context, store *Store, cfg DaemonConfig) error {
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = "127.0.0.1:8787"
+	}
+	if cfg.GossipInterval <= 0 {
+		cfg.GossipInterval = 15 * time.Second
+	}
+	if cfg.SyncLimit <= 0 {
+		cfg.SyncLimit = defaultSyncLimit
+	}
+	if cfg.MaxSyncRounds <= 0 {
+		cfg.MaxSyncRounds = defaultMaxSyncRounds
+	}
+	if cfg.HTTPClient == nil {
+		cfg.HTTPClient = &http.Client{Timeout: 8 * time.Second}
+	}
+
+	handler := NewHandler(store, cfg.SyncLimit)
+	server := &http.Server{
+		Addr:    cfg.ListenAddr,
+		Handler: handler,
+	}
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		err := server.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrCh <- err
+		}
+		close(serverErrCh)
+	}()
+
+	gossipErrCh := make(chan error, 1)
+	go func() {
+		defer close(gossipErrCh)
+		if err := runGossipLoop(ctx, store, cfg); err != nil && !errors.Is(err, context.Canceled) {
+			gossipErrCh <- err
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+	case err := <-serverErrCh:
+		if err != nil {
+			return err
+		}
+	case err := <-gossipErrCh:
+		if err != nil {
+			return err
+		}
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+func runGossipLoop(ctx context.Context, store *Store, cfg DaemonConfig) error {
+	syncAllPeers := func() {
+		peers, err := store.ListPeers()
+		if err != nil {
+			logf(cfg.Logger, "gossip: failed to list peers: %v", err)
+			return
+		}
+		for _, peer := range peers {
+			stats, err := SyncPeer(ctx, store, peer, cfg.SyncLimit, cfg.MaxSyncRounds, cfg.HTTPClient)
+			if err != nil {
+				logf(cfg.Logger, "gossip: sync with %s failed: %v", peer, err)
+				continue
+			}
+			if stats.Pulled > 0 || stats.Accepted > 0 || stats.Rejected > 0 || stats.Dropped > 0 {
+				logf(
+					cfg.Logger,
+					"gossip: peer=%s rounds=%d sent=%d pulled=%d accepted=%d rejected=%d dropped=%d",
+					stats.Peer,
+					stats.Rounds,
+					stats.Sent,
+					stats.Pulled,
+					stats.Accepted,
+					stats.Rejected,
+					stats.Dropped,
+				)
+			}
+		}
+	}
+
+	syncAllPeers()
+	ticker := time.NewTicker(cfg.GossipInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			syncAllPeers()
+		}
+	}
+}
+
+func logf(logger *log.Logger, format string, args ...any) {
+	if logger == nil {
+		return
+	}
+	logger.Printf(format, args...)
+}
+
+// NewHandler creates an HTTP handler that supports gossip sync endpoints.
+func NewHandler(store *Store, defaultLimit int) http.Handler {
+	if defaultLimit <= 0 {
+		defaultLimit = defaultSyncLimit
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/node", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		peers, err := store.ListPeers()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		info := NodeInfo{
+			NodeID:  store.NodeID(),
+			Peers:   peers,
+			Summary: store.Summary(),
+		}
+		writeJSON(w, http.StatusOK, info)
+	})
+
+	mux.HandleFunc("/v1/sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		defer r.Body.Close()
+
+		var req SyncRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON request")
+			return
+		}
+		if req.Summary == nil {
+			req.Summary = map[string]uint64{}
+		}
+
+		limit := req.Limit
+		if limit <= 0 {
+			limit = defaultLimit
+		}
+		if limit > 2048 {
+			limit = 2048
+		}
+
+		accepted := 0
+		rejected := 0
+		for _, op := range req.Ops {
+			added, err := store.AddRemoteOp(op)
+			if err != nil {
+				rejected++
+				continue
+			}
+			if added {
+				accepted++
+			}
+		}
+
+		resp := SyncResponse{
+			NodeID:   store.NodeID(),
+			Summary:  store.Summary(),
+			Ops:      store.MissingFor(req.Summary, limit),
+			Accepted: accepted,
+			Rejected: rejected,
+		}
+		writeJSON(w, http.StatusOK, resp)
+	})
+
+	return mux
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	_ = encoder.Encode(payload)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{
+		"error": fmt.Sprintf("%s", message),
+	})
+}

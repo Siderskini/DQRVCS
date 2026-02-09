@@ -1,0 +1,154 @@
+package gossip
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+)
+
+const (
+	defaultSyncLimit     = 256
+	defaultMaxSyncRounds = 6
+)
+
+// SyncRequest is exchanged between peers to reconcile operation logs.
+type SyncRequest struct {
+	Summary map[string]uint64 `json:"summary"`
+	Ops     []Operation       `json:"ops,omitempty"`
+	Limit   int               `json:"limit,omitempty"`
+}
+
+// SyncResponse is returned by the sync endpoint.
+type SyncResponse struct {
+	NodeID   string            `json:"node_id"`
+	Summary  map[string]uint64 `json:"summary"`
+	Ops      []Operation       `json:"ops,omitempty"`
+	Accepted int               `json:"accepted"`
+	Rejected int               `json:"rejected"`
+}
+
+// SyncStats summarizes a sync exchange with one peer.
+type SyncStats struct {
+	Peer     string
+	Rounds   int
+	Sent     int
+	Pulled   int
+	Accepted int
+	Rejected int
+	Dropped  int
+}
+
+// SyncPeer performs bounded anti-entropy sync with a single peer.
+func SyncPeer(
+	ctx context.Context,
+	store *Store,
+	peer string,
+	limit int,
+	maxRounds int,
+	client *http.Client,
+) (SyncStats, error) {
+	normalizedPeer, err := normalizePeer(peer)
+	if err != nil {
+		return SyncStats{}, err
+	}
+	if limit <= 0 {
+		limit = defaultSyncLimit
+	}
+	if maxRounds <= 0 {
+		maxRounds = defaultMaxSyncRounds
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 8 * time.Second}
+	}
+
+	stats := SyncStats{Peer: normalizedPeer}
+	toSend := []Operation(nil)
+	for round := 0; round < maxRounds; round++ {
+		req := SyncRequest{
+			Summary: store.Summary(),
+			Ops:     toSend,
+			Limit:   limit,
+		}
+		stats.Sent += len(toSend)
+
+		resp, err := callSync(ctx, client, normalizedPeer, req)
+		if err != nil {
+			return stats, err
+		}
+
+		stats.Rounds++
+		stats.Accepted += resp.Accepted
+		stats.Rejected += resp.Rejected
+
+		pulledNow := 0
+		for _, op := range resp.Ops {
+			added, err := store.AddRemoteOp(op)
+			if err != nil {
+				stats.Dropped++
+				continue
+			}
+			if added {
+				pulledNow++
+			}
+		}
+		stats.Pulled += pulledNow
+
+		toSend = store.MissingFor(resp.Summary, limit)
+		if pulledNow == 0 && len(toSend) == 0 {
+			break
+		}
+	}
+
+	return stats, nil
+}
+
+func callSync(ctx context.Context, client *http.Client, peer string, req SyncRequest) (SyncResponse, error) {
+	var resp SyncResponse
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return resp, fmt.Errorf("marshal sync request: %w", err)
+	}
+
+	endpoint := strings.TrimSuffix(peer, "/") + "/v1/sync"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return resp, fmt.Errorf("build sync request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return resp, fmt.Errorf("request %s: %w", endpoint, err)
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		var errPayload map[string]any
+		_ = json.NewDecoder(httpResp.Body).Decode(&errPayload)
+		msg := ""
+		if v, ok := errPayload["error"].(string); ok {
+			msg = strings.TrimSpace(v)
+		}
+		if msg == "" {
+			msg = httpResp.Status
+		}
+		return resp, fmt.Errorf("sync request failed: %s", msg)
+	}
+
+	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
+		return resp, fmt.Errorf("decode sync response: %w", err)
+	}
+	if resp.Summary == nil {
+		resp.Summary = map[string]uint64{}
+	}
+	if strings.TrimSpace(resp.NodeID) == "" {
+		return resp, errors.New("sync response missing node_id")
+	}
+	return resp, nil
+}
