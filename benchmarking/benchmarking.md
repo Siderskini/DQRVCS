@@ -109,3 +109,118 @@ The following benchmark run was performed on Siddharth Viswanathan's Ubuntu 24 m
 | `stage_single_file` | 2.552 | 3.628 | 42.17 | 2.920 | 4.578 |
 | `unstage_single_file` | 2.543 | 3.922 | 54.20 | 2.920 | 4.515 |
 | `commit_allow_empty` | 3.765 | 10.745 | 185.43 | 4.377 | 13.341 |
+
+## Two-Device Runbook (Ubuntu + macOS)
+
+Use this exact sequence to collect two-node LAN benchmark data.
+
+### 1) Build and script permissions on both machines
+
+From repo root:
+
+```bash
+go build -o vcs .
+chmod +x benchmarking/lan/*.sh
+```
+
+### 2) Determine LAN IPs
+
+On Ubuntu:
+
+```bash
+hostname -I
+```
+
+On macOS:
+
+```bash
+ipconfig getifaddr en0
+```
+
+Define:
+
+- `UBUNTU_IP=<ubuntu_lan_ip>`
+- `MAC_IP=<mac_lan_ip>`
+
+### 3) Start daemon on macOS (keep terminal open)
+
+```bash
+./benchmarking/lan/start_daemon.sh \
+  --repo "$PWD" \
+  --listen 0.0.0.0:8787 \
+  --interval 1s
+```
+
+### 4) Start daemon on Ubuntu (keep terminal open)
+
+```bash
+./benchmarking/lan/start_daemon.sh \
+  --repo "$PWD" \
+  --listen 0.0.0.0:8787 \
+  --interval 1s
+```
+
+### 5) Configure peers in both directions
+
+On Ubuntu:
+
+```bash
+./benchmarking/lan/configure_peer.sh \
+  --repo "$PWD" \
+  --peer-url "http://$MAC_IP:8787"
+```
+
+On macOS:
+
+```bash
+./benchmarking/lan/configure_peer.sh \
+  --repo "$PWD" \
+  --peer-url "http://$UBUNTU_IP:8787"
+```
+
+### 6) Run benchmark from Ubuntu targeting macOS
+
+```bash
+./benchmarking/lan/run_two_node_benchmark.sh \
+  --repo "$PWD" \
+  --remote-url "http://$MAC_IP:8787" \
+  --iterations 50 \
+  --warmup 10 \
+  --mode manual-sync \
+  --tag ubuntu-to-mac
+```
+
+### 7) Optional reverse-direction run (macOS targeting Ubuntu)
+
+```bash
+./benchmarking/lan/run_two_node_benchmark.sh \
+  --repo "$PWD" \
+  --remote-url "http://$UBUNTU_IP:8787" \
+  --iterations 50 \
+  --warmup 10 \
+  --mode manual-sync \
+  --tag mac-to-ubuntu
+```
+
+### 8) Collect output artifacts
+
+Each run writes to:
+
+```text
+benchmarking/results/lan/<timestamp>-<tag>/
+```
+
+Files:
+
+- `sync_rtt.csv`
+- `replication_latency.csv`
+- `summary.json`
+- `summary.md`
+
+Find latest run:
+
+```bash
+ls -1dt benchmarking/results/lan/* | head -n 1
+```
+
+Stop daemons with `Ctrl+C` in daemon terminals when finished.
