@@ -30,6 +30,7 @@ This directory contains reproducible benchmark tooling for:
 - `lan/start_daemon.sh`: starts a gossip daemon with benchmarking defaults.
 - `lan/configure_peer.sh`: configures and validates peer connectivity.
 - `lan/run_two_node_benchmark.sh`: driver benchmark for two-device LAN speed tests.
+- `lan/run_two_node_benchmark_heavy.sh`: heavy two-device LAN benchmark with 10-20 files (1-10 KB each) per iteration by default.
 - `lan/README.md`: step-by-step runbook for Ubuntu + Mac two-node benchmarking.
 
 ## Scenarios Covered
@@ -224,3 +225,80 @@ ls -1dt benchmarking/results/lan/* | head -n 1
 ```
 
 Stop daemons with `Ctrl+C` in daemon terminals when finished.
+
+## Heavy Two-Node Runbook (Ubuntu + macOS)
+
+For complex workflow benchmarking with files (default 10-20 files, each 1-10 KB), use:
+
+```bash
+./benchmarking/lan/run_two_node_benchmark_heavy.sh \
+  --repo "$PWD" \
+  --remote-url "http://$MAC_IP:8787" \
+  --iterations 25 \
+  --warmup 5 \
+  --files-min 10 \
+  --files-max 20 \
+  --size-min-kb 1 \
+  --size-max-kb 10 \
+  --mode manual-sync \
+  --tag ubuntu-to-mac-heavy
+```
+
+Reverse direction from macOS:
+
+```bash
+./benchmarking/lan/run_two_node_benchmark_heavy.sh \
+  --repo "$PWD" \
+  --remote-url "http://$UBUNTU_IP:8787" \
+  --iterations 25 \
+  --warmup 5 \
+  --files-min 10 \
+  --files-max 20 \
+  --size-min-kb 1 \
+  --size-max-kb 10 \
+  --mode manual-sync \
+  --tag mac-to-ubuntu-heavy
+```
+
+Heavy run output directories:
+
+```text
+benchmarking/results/lan-heavy/<timestamp>-<tag>/
+```
+
+Heavy artifacts:
+
+- `heavy_workflow.csv`
+- `summary.json`
+- `summary.md`
+
+## Published Heavy Results (Ubuntu 24 -> macOS)
+
+The following heavy benchmark run was performed on Siddharth Viswanathan's Ubuntu 24 machine against a peer macOS node on the same LAN.
+
+- Run timestamp (UTC): `20260210T201129Z`
+- Mode: `manual-sync`
+- Iterations: `25` (warmup `5`)
+- Workload target per iteration: `10..20` files, each `1..10 KB`
+- Measured failures: `0`
+- Source files:
+  - `benchmarking/results/lan-heavy/20260210T201129Z-ubuntu-to-mac-heavy/heavy_workflow.csv`
+  - `benchmarking/results/lan-heavy/20260210T201129Z-ubuntu-to-mac-heavy/summary.json`
+  - `benchmarking/results/lan-heavy/20260210T201129Z-ubuntu-to-mac-heavy/summary.md`
+
+### Workload Realized (Measured Iterations)
+
+| Quantity | min | avg | max |
+|---|---:|---:|---:|
+| `file_count` | 10.000 | 14.920 | 20.000 |
+| `total_file_bytes` | 39936.000 | 84459.520 | 118784.000 |
+| `total_payload_b64_bytes` | 53264.000 | 112633.440 | 158400.000 |
+
+### Timing Metrics (ms, measured+ok samples)
+
+| Metric | samples | mean | median | p95 | stddev | min | max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `generate` | 25 | 20.994 | 21.547 | 26.799 | 4.318 | 14.262 | 28.073 |
+| `append` | 25 | 761.818 | 735.444 | 1344.340 | 312.138 | 309.615 | 1352.280 |
+| `sync` | 25 | 222.917 | 208.471 | 405.756 | 109.891 | 91.029 | 613.086 |
+| `replication` | 25 | 276.430 | 260.446 | 434.786 | 118.892 | 143.313 | 696.276 |

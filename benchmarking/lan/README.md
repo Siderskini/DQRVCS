@@ -33,6 +33,12 @@ It is designed for your current setup:
 - `run_two_node_benchmark.sh`
   - Driver benchmark script (run from Node A, targeting Node B).
   - Writes raw CSV and summary reports.
+- `run_two_node_benchmark_heavy.sh`
+  - Driver benchmark script for a heavier workflow:
+    - 10-20 files per iteration by default
+    - each file 1-10 KB by default
+    - one heavy op appended per file (payload includes file content)
+  - Writes raw CSV and summary reports.
 
 ## Pre-Run Checklist
 
@@ -98,18 +104,66 @@ On Node B:
 
 Run the same command from Node B against Node A to compare directionality.
 
+## Heavy Workflow Run
+
+Use this when you want insights for a more complex file-driven workflow.
+
+From Node A (Ubuntu) targeting Node B (macOS):
+
+```bash
+./benchmarking/lan/run_two_node_benchmark_heavy.sh \
+  --repo "$PWD" \
+  --remote-url "http://<MACBOOK_LAN_IP>:8787" \
+  --iterations 25 \
+  --warmup 5 \
+  --files-min 10 \
+  --files-max 20 \
+  --size-min-kb 1 \
+  --size-max-kb 10 \
+  --mode manual-sync \
+  --tag ubuntu-to-mac-heavy
+```
+
+Optional reverse-direction run from Node B:
+
+```bash
+./benchmarking/lan/run_two_node_benchmark_heavy.sh \
+  --repo "$PWD" \
+  --remote-url "http://<UBUNTU_LAN_IP>:8787" \
+  --iterations 25 \
+  --warmup 5 \
+  --files-min 10 \
+  --files-max 20 \
+  --size-min-kb 1 \
+  --size-max-kb 10 \
+  --mode manual-sync \
+  --tag mac-to-ubuntu-heavy
+```
+
 ## Output Artifacts
 
-Each run creates a directory:
+Each light run creates a directory:
 
 ```text
 benchmarking/results/lan/<timestamp>[-tag]/
+```
+
+Each heavy run creates a directory:
+
+```text
+benchmarking/results/lan-heavy/<timestamp>[-tag]/
 ```
 
 Files:
 
 - `sync_rtt.csv`
 - `replication_latency.csv`
+- `summary.json`
+- `summary.md`
+
+Heavy run files:
+
+- `heavy_workflow.csv`
 - `summary.json`
 - `summary.md`
 
