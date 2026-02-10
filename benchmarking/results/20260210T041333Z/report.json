@@ -1,0 +1,180 @@
+{
+  "timestamp_utc": "2026-02-10T04:13:37Z",
+  "host_os": "linux",
+  "host_arch": "amd64",
+  "git_binary": "/usr/bin/git",
+  "vcs_binary": "/home/sidd/Documents/golang/VCS/vcs",
+  "iterations": 40,
+  "warmup_iterations": 8,
+  "scenario_count": 7,
+  "results": [
+    {
+      "name": "status_short_clean",
+      "description": "Working tree status in a clean repository",
+      "git": {
+        "count": 40,
+        "mean_ms": 2.6475168499999997,
+        "median_ms": 2.8627135,
+        "p95_ms": 3.009762,
+        "stddev_ms": 0.37351609038925954,
+        "min_ms": 1.988713,
+        "max_ms": 3.065763
+      },
+      "vcs": {
+        "count": 40,
+        "mean_ms": 3.9512644749999994,
+        "median_ms": 4.053275,
+        "p95_ms": 4.528992,
+        "stddev_ms": 0.48276227722663806,
+        "min_ms": 2.95733,
+        "max_ms": 4.735776
+      },
+      "overhead_ratio": 1.4924416722786864,
+      "overhead_pct": 49.244167227868644
+    },
+    {
+      "name": "log_head_oneline",
+      "description": "Show latest commit as one line",
+      "git": {
+        "count": 40,
+        "mean_ms": 0.8168092500000002,
+        "median_ms": 0.8159595,
+        "p95_ms": 0.893986,
+        "stddev_ms": 0.06282693676789837,
+        "min_ms": 0.605777,
+        "max_ms": 0.988241
+      },
+      "vcs": {
+        "count": 40,
+        "mean_ms": 2.166411024999999,
+        "median_ms": 2.2128595,
+        "p95_ms": 2.344724,
+        "stddev_ms": 0.14158461846568776,
+        "min_ms": 1.812585,
+        "max_ms": 2.408667
+      },
+      "overhead_ratio": 2.6522851265457614,
+      "overhead_pct": 165.22851265457615
+    },
+    {
+      "name": "branch_list",
+      "description": "List local branches",
+      "git": {
+        "count": 40,
+        "mean_ms": 0.74652,
+        "median_ms": 0.7467265000000001,
+        "p95_ms": 0.795952,
+        "stddev_ms": 0.03833853671438178,
+        "min_ms": 0.589807,
+        "max_ms": 0.799817
+      },
+      "vcs": {
+        "count": 40,
+        "mean_ms": 2.1083904500000004,
+        "median_ms": 2.113745,
+        "p95_ms": 2.236596,
+        "stddev_ms": 0.11439096057708185,
+        "min_ms": 1.897278,
+        "max_ms": 2.412991
+      },
+      "overhead_ratio": 2.824291981460645,
+      "overhead_pct": 182.4291981460645
+    },
+    {
+      "name": "checkout_branch",
+      "description": "Checkout an existing local branch",
+      "git": {
+        "count": 40,
+        "mean_ms": 2.680458525,
+        "median_ms": 2.422251,
+        "p95_ms": 3.887561,
+        "stddev_ms": 0.7603232901522217,
+        "min_ms": 1.321267,
+        "max_ms": 3.927341
+      },
+      "vcs": {
+        "count": 40,
+        "mean_ms": 3.229795125,
+        "median_ms": 3.2714594999999997,
+        "p95_ms": 3.507662,
+        "stddev_ms": 0.2657979527327277,
+        "min_ms": 2.315478,
+        "max_ms": 3.638697
+      },
+      "overhead_ratio": 1.2049412795894687,
+      "overhead_pct": 20.494127958946873
+    },
+    {
+      "name": "stage_single_file",
+      "description": "Stage one modified file",
+      "git": {
+        "count": 40,
+        "mean_ms": 2.5517538749999997,
+        "median_ms": 2.5492039999999996,
+        "p95_ms": 2.920135,
+        "stddev_ms": 0.30561810076656026,
+        "min_ms": 1.824666,
+        "max_ms": 3.010763
+      },
+      "vcs": {
+        "count": 40,
+        "mean_ms": 3.6278852500000007,
+        "median_ms": 3.768325,
+        "p95_ms": 4.577726,
+        "stddev_ms": 0.785932015885431,
+        "min_ms": 1.964294,
+        "max_ms": 4.75622
+      },
+      "overhead_ratio": 1.4217222458415983,
+      "overhead_pct": 42.172224584159835
+    },
+    {
+      "name": "unstage_single_file",
+      "description": "Unstage one file after it has been staged",
+      "git": {
+        "count": 40,
+        "mean_ms": 2.5431898999999993,
+        "median_ms": 2.6294785000000003,
+        "p95_ms": 2.919626,
+        "stddev_ms": 0.38376590547453543,
+        "min_ms": 1.731662,
+        "max_ms": 3.026196
+      },
+      "vcs": {
+        "count": 40,
+        "mean_ms": 3.921694975,
+        "median_ms": 4.0422655,
+        "p95_ms": 4.515281,
+        "stddev_ms": 0.47555197667365906,
+        "min_ms": 2.939405,
+        "max_ms": 4.599526
+      },
+      "overhead_ratio": 1.5420378065358,
+      "overhead_pct": 54.203780653580004
+    },
+    {
+      "name": "commit_allow_empty",
+      "description": "Create an empty commit with a message",
+      "git": {
+        "count": 40,
+        "mean_ms": 3.764649275000001,
+        "median_ms": 3.9061525,
+        "p95_ms": 4.377232,
+        "stddev_ms": 0.517901232809065,
+        "min_ms": 2.909706,
+        "max_ms": 4.586681
+      },
+      "vcs": {
+        "count": 40,
+        "mean_ms": 10.745467549999997,
+        "median_ms": 10.2867105,
+        "p95_ms": 13.3413,
+        "stddev_ms": 1.629514941136594,
+        "min_ms": 8.254449,
+        "max_ms": 13.61287
+      },
+      "overhead_ratio": 2.854307736276441,
+      "overhead_pct": 185.4307736276441
+    }
+  ]
+}

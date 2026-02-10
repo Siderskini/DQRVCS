@@ -29,3 +29,4 @@ Cargo.lock
 
 about/Retrospective.md
 vcs
+.vcs/

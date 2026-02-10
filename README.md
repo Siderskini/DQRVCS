@@ -145,6 +145,7 @@ cargo run --manifest-path gui/Cargo.toml
 
 - `GettingStarted.md`: short decentralized GUI onboarding for Git users
 - `Manual.md`: full GUI reference and troubleshooting
+- `benchmarking/benchmarking.md`: benchmark guide for measuring `vcs` wrapper overhead vs native `git`
 
 If `cargo build --release` fails with a `rust-lld`/`.eh_frame` linker error, this repo already pins Rust linker flags in:
 
